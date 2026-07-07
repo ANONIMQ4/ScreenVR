@@ -32,6 +32,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private static final String FPS_KEY = "raw_fps";
     private static final String BITRATE_KEY = "raw_bitrate";
     private static final String FIT_KEY = "raw_fit";
+    private static final String EYE_OFFSET_KEY = "eye_offset";
     private static final String DEFAULT_URL = "rawh264://127.0.0.1:8094?w=1170&h=1080";
 
     private RawH264Player h264Player;
@@ -42,6 +43,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private EditText heightInput;
     private EditText fpsInput;
     private EditText bitrateInput;
+    private EditText eyeOffsetInput;
     private Button sbsButton;
     private Button fitButton;
     private Surface videoSurface;
@@ -63,6 +65,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         videoView = new VrVideoView(this);
         videoView.setVideoSurfaceListener(this);
         videoView.setSbsMode(prefs.getBoolean(SBS_KEY, false));
+        videoView.setEyeOffsetPercent(prefs.getInt(EYE_OFFSET_KEY, 0));
         root.addView(videoView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -168,18 +171,29 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         settingsRow.addView(fpsInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         settingsRow.addView(bitrateInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
+        LinearLayout viewRow = new LinearLayout(this);
+        viewRow.setOrientation(LinearLayout.HORIZONTAL);
+        viewRow.setGravity(Gravity.CENTER_VERTICAL);
+        box.addView(viewRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
+        eyeOffsetInput = smallInput(String.valueOf(prefs.getInt(EYE_OFFSET_KEY, 0)), "Eye %");
+        viewRow.addView(eyeOffsetInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
         fitButton = new Button(this);
         fitButton.setText(prefs.getString(FIT_KEY, "contain"));
         fitButton.setOnClickListener(v -> {
             fitButton.setText("contain".contentEquals(fitButton.getText()) ? "cover" : "contain");
             hideSystemUi();
         });
-        settingsRow.addView(fitButton);
+        viewRow.addView(fitButton);
 
         Button apply = new Button(this);
         apply.setText("Apply");
         apply.setOnClickListener(v -> applyRawH264Settings());
-        settingsRow.addView(apply);
+        viewRow.addView(apply);
 
         return box;
     }
@@ -202,6 +216,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         int height = parseInt(heightInput.getText().toString(), 1080);
         int fps = parseInt(fpsInput.getText().toString(), 30);
         int bitrate = parseInt(bitrateInput.getText().toString(), 5000);
+        int eyeOffset = clampInt(parseInt(eyeOffsetInput.getText().toString(), 0), 0, 5);
         String fit = fitButton.getText().toString().toLowerCase();
         String url = "rawh264://127.0.0.1:8094?w=" + width + "&h=" + height;
 
@@ -210,10 +225,13 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
                 .putInt(HEIGHT_KEY, height)
                 .putInt(FPS_KEY, fps)
                 .putInt(BITRATE_KEY, bitrate)
+                .putInt(EYE_OFFSET_KEY, eyeOffset)
                 .putString(FIT_KEY, fit)
                 .putString(URL_KEY, url)
                 .apply();
 
+        eyeOffsetInput.setText(String.valueOf(eyeOffset));
+        videoView.setEyeOffsetPercent(eyeOffset);
         urlInput.setText(url);
         hideKeyboard();
         sendRawH264Config(width, height, fps, bitrate, fit, url);
@@ -296,6 +314,10 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         } catch (NumberFormatException ignored) {
             return fallback;
         }
+    }
+
+    private int clampInt(int value, int minimum, int maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 
     private void updateSbsButton() {

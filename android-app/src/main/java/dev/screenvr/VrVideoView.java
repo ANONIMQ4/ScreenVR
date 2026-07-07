@@ -51,6 +51,11 @@ public class VrVideoView extends GLSurfaceView {
         requestRender();
     }
 
+    public void setEyeOffsetPercent(float percent) {
+        renderer.setEyeOffsetPercent(percent);
+        requestRender();
+    }
+
     private static final class VideoRenderer implements Renderer, SurfaceTexture.OnFrameAvailableListener {
         private final GLSurfaceView view;
         private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -77,11 +82,13 @@ public class VrVideoView extends GLSurfaceView {
         private int aTexCoord;
         private int uTexture;
         private int uSTMatrix;
+        private int uEyeOffset;
         private int width;
         private int height;
         private volatile boolean frameAvailable;
         private volatile boolean sbsMode;
         private volatile float videoAspect = 16f / 9f;
+        private volatile float eyeOffsetPercent;
 
         VideoRenderer(GLSurfaceView view) {
             this.view = view;
@@ -108,6 +115,10 @@ public class VrVideoView extends GLSurfaceView {
             }
         }
 
+        void setEyeOffsetPercent(float percent) {
+            eyeOffsetPercent = Math.max(0f, Math.min(5f, percent));
+        }
+
         @Override
         public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
@@ -115,6 +126,7 @@ public class VrVideoView extends GLSurfaceView {
             aTexCoord = GLES20.glGetAttribLocation(program, "aTexCoord");
             uTexture = GLES20.glGetUniformLocation(program, "uTexture");
             uSTMatrix = GLES20.glGetUniformLocation(program, "uSTMatrix");
+            uEyeOffset = GLES20.glGetUniformLocation(program, "uEyeOffset");
 
             textureId = createExternalTexture();
             surfaceTexture = new SurfaceTexture(textureId);
@@ -148,10 +160,11 @@ public class VrVideoView extends GLSurfaceView {
             GLES20.glClearColor(0f, 0f, 0f, 1f);
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             if (sbsMode) {
-                drawFitted(0, 0, width / 2, height);
-                drawFitted(width / 2, 0, width - width / 2, height);
+                float offset = eyeOffsetPercent / 100f;
+                drawFitted(0, 0, width / 2, height, -offset);
+                drawFitted(width / 2, 0, width - width / 2, height, offset);
             } else {
-                drawFitted(0, 0, width, height);
+                drawFitted(0, 0, width, height, 0f);
             }
         }
 
@@ -161,7 +174,7 @@ public class VrVideoView extends GLSurfaceView {
             view.requestRender();
         }
 
-        private void drawFitted(int x, int y, int viewportWidth, int viewportHeight) {
+        private void drawFitted(int x, int y, int viewportWidth, int viewportHeight, float eyeOffset) {
             int drawWidth = viewportWidth;
             int drawHeight = Math.round(viewportWidth / videoAspect);
             if (drawHeight > viewportHeight) {
@@ -171,15 +184,16 @@ public class VrVideoView extends GLSurfaceView {
             int drawX = x + (viewportWidth - drawWidth) / 2;
             int drawY = y + (viewportHeight - drawHeight) / 2;
             GLES20.glViewport(drawX, drawY, drawWidth, drawHeight);
-            drawTexture();
+            drawTexture(eyeOffset);
         }
 
-        private void drawTexture() {
+        private void drawTexture(float eyeOffset) {
             GLES20.glUseProgram(program);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
             GLES20.glUniform1i(uTexture, 0);
             GLES20.glUniformMatrix4fv(uSTMatrix, 1, false, stMatrix, 0);
+            GLES20.glUniform1f(uEyeOffset, eyeOffset);
 
             vertexBuffer.position(0);
             GLES20.glEnableVertexAttribArray(aPosition);
@@ -259,9 +273,11 @@ public class VrVideoView extends GLSurfaceView {
                 "#extension GL_OES_EGL_image_external : require\n" +
                 "precision mediump float;\n" +
                 "uniform samplerExternalOES uTexture;\n" +
+                "uniform float uEyeOffset;\n" +
                 "varying vec2 vTexCoord;\n" +
                 "void main() {\n" +
-                "  gl_FragColor = texture2D(uTexture, vTexCoord);\n" +
+                "  vec2 shifted = vec2(clamp(vTexCoord.x + uEyeOffset, 0.0, 1.0), vTexCoord.y);\n" +
+                "  gl_FragColor = texture2D(uTexture, shifted);\n" +
                 "}\n";
     }
 }
