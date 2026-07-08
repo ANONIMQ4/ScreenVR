@@ -8,15 +8,19 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let width: Int
     private let height: Int
     private let fps: Int
+    private let queueDepth: Int
     private let queue = DispatchQueue(label: "dev.screenvr.sck-capture")
     private var stream: SCStream?
     private var statsStarted = Date()
     private var framesInWindow = 0
+    private var lastFrameTime: TimeInterval?
+    private var frameIntervals: [Double] = []
 
-    init(width: Int, height: Int, fps: Int) {
+    init(width: Int, height: Int, fps: Int, queueDepth: Int) {
         self.width = width
         self.height = height
         self.fps = fps
+        self.queueDepth = queueDepth
     }
 
     func start() async throws {
@@ -31,7 +35,7 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.height = height
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        configuration.queueDepth = 2
+        configuration.queueDepth = queueDepth
         configuration.showsCursor = false
 
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -93,15 +97,47 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func recordFrame() {
+        let now = Date().timeIntervalSinceReferenceDate
+        if let lastFrameTime {
+            frameIntervals.append(now - lastFrameTime)
+        }
+        lastFrameTime = now
+
         framesInWindow += 1
         let elapsed = Date().timeIntervalSince(statsStarted)
         guard elapsed >= 1.0 else {
             return
         }
         let measured = Double(framesInWindow) / elapsed
-        FileHandle.standardError.write(String(format: "sck fps %.1f\n", measured).data(using: .utf8)!)
+        let expectedInterval = 1.0 / Double(fps)
+        let lateThreshold = expectedInterval * 1.5
+        let intervals = frameIntervals.sorted()
+        let intervalAverage = frameIntervals.isEmpty ? 0.0 : frameIntervals.reduce(0.0, +) / Double(frameIntervals.count)
+        let intervalP95 = percentile(intervals, 0.95)
+        let intervalMax = intervals.last ?? 0.0
+        let lateFrames = frameIntervals.filter { $0 > lateThreshold }.count
+        FileHandle.standardError.write(
+            String(
+                format: "sck fps %.1f interval_avg_ms %.2f interval_p95_ms %.2f interval_max_ms %.2f late %d\n",
+                measured,
+                intervalAverage * 1000.0,
+                intervalP95 * 1000.0,
+                intervalMax * 1000.0,
+                lateFrames
+            ).data(using: .utf8)!
+        )
         framesInWindow = 0
+        frameIntervals.removeAll(keepingCapacity: true)
         statsStarted = Date()
+    }
+
+    private func percentile(_ sortedValues: [Double], _ quantile: Double) -> Double {
+        guard !sortedValues.isEmpty else {
+            return 0.0
+        }
+        let clamped = min(max(quantile, 0.0), 1.0)
+        let index = Int((Double(sortedValues.count - 1) * clamped).rounded())
+        return sortedValues[index]
     }
 }
 
@@ -123,7 +159,8 @@ if #available(macOS 12.3, *) {
     let capture = ScreenCapture(
         width: intArg("--width", fallback: 960),
         height: intArg("--height", fallback: 540),
-        fps: intArg("--fps", fallback: 30)
+        fps: intArg("--fps", fallback: 30),
+        queueDepth: intArg("--queue-depth", fallback: 2)
     )
 
     Task {

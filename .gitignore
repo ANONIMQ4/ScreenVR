@@ -12,6 +12,7 @@ dist/
 __pycache__/
 *.pyc
 server/sck-capture
+tools/diagnostics/raw-frame-source
 tmp_screen_vr_client.xml
 .DS_Store
 .idea/
