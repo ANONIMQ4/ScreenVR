@@ -33,6 +33,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private static final String FPS_KEY = "raw_fps";
     private static final String BITRATE_KEY = "raw_bitrate";
     private static final String FIT_KEY = "raw_fit";
+    private static final String CONTROL_URL_KEY = "control_url";
     private static final String EYE_OFFSET_KEY = "eye_offset";
     private static final String LENS_MODE_KEY = "lens_mode";
     private static final String LENS_STRENGTH_KEY = "lens_strength";
@@ -48,7 +49,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private static final float DEFAULT_LENS_SIZE_X = 92f;
     private static final float DEFAULT_LENS_SIZE_Y = 92f;
     private static final int DEFAULT_LENS_MASK = 1;
-    private static final String DEFAULT_URL = "rawh264://127.0.0.1:8094?w=1170&h=1080&fps=30";
+    private static final String DEFAULT_URL = "rtph264://0.0.0.0:5004?w=900&h=600&fps=60";
 
     private RawH264Player h264Player;
     private VrVideoView videoView;
@@ -187,7 +188,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         urlInput.setText(savedUrl);
         urlInput.setTextColor(0xffffffff);
         urlInput.setHintTextColor(0x88ffffff);
-        urlInput.setHint("rawh264://127.0.0.1:8094?w=1170&h=1080&fps=30");
+        urlInput.setHint("rtph264://0.0.0.0:5004?w=900&h=600&fps=60");
         urlInput.setTextSize(14);
         urlInput.setSelectAllOnFocus(true);
         topRow.addView(urlInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
@@ -354,7 +355,9 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         float sizeY = clampFloat(parseFloat(sizeYInput.getText().toString(), 100f), 50f, 150f);
         int maskMode = maskModeFromButton();
         String fit = fitButton.getText().toString().toLowerCase();
-        String url = "rawh264://127.0.0.1:8094?w=" + width + "&h=" + height + "&fps=" + fps;
+        String currentUrl = urlInput.getText().toString().trim();
+        String url = buildRawH264Url(currentUrl, width, height, fps);
+        String controlEndpoint = controlEndpointFor(currentUrl);
 
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putInt(WIDTH_KEY, width)
@@ -384,7 +387,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         videoView.setLensSettings(lensMode, lensStrength, zoom, centerOffset, sizeX, sizeY, maskMode);
         urlInput.setText(url);
         hideKeyboard();
-        sendRawH264Config(width, height, fps, bitrate, fit, url);
+        sendRawH264Config(width, height, fps, bitrate, fit, url, controlEndpoint);
     }
 
     private void applyLensSettings() {
@@ -412,7 +415,35 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         videoView.setLensSettings(lensMode, lensStrength, zoom, centerOffset, sizeX, sizeY, maskMode);
     }
 
-    private void sendRawH264Config(int width, int height, int fps, int bitrate, String fit, String streamUrl) {
+    private String buildRawH264Url(String currentUrl, int width, int height, int fps) {
+        Uri uri = Uri.parse(currentUrl);
+        String scheme = uri.getScheme();
+        if ("rtph264".equals(scheme)) {
+            int port = uri.getPort() > 0 ? uri.getPort() : 5004;
+            String host = uri.getHost() != null ? uri.getHost() : "0.0.0.0";
+            return "rtph264://" + host + ":" + port + "?w=" + width + "&h=" + height + "&fps=" + fps;
+        }
+        if ("rawh264".equals(scheme)) {
+            int port = uri.getPort() > 0 ? uri.getPort() : 8094;
+            String host = uri.getHost() != null ? uri.getHost() : "127.0.0.1";
+            return "rawh264://" + host + ":" + port + "?w=" + width + "&h=" + height + "&fps=" + fps;
+        }
+        return "rtph264://0.0.0.0:5004?w=" + width + "&h=" + height + "&fps=" + fps;
+    }
+
+    private String controlEndpointFor(String currentUrl) {
+        Uri uri = Uri.parse(currentUrl);
+        String embedded = uri.getQueryParameter("control");
+        if (embedded != null && !embedded.isEmpty()) {
+            return embedded;
+        }
+        if ("rtph264".equals(uri.getScheme())) {
+            return getSharedPreferences(PREFS, MODE_PRIVATE).getString(CONTROL_URL_KEY, "");
+        }
+        return "http://127.0.0.1:8095/config";
+    }
+
+    private void sendRawH264Config(int width, int height, int fps, int bitrate, String fit, String streamUrl, String controlEndpoint) {
         String json = "{"
                 + "\"width\":" + width + ","
                 + "\"height\":" + height + ","
@@ -423,19 +454,21 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         new Thread(() -> {
             HttpURLConnection connection = null;
             try {
-                URL endpoint = new URL("http://127.0.0.1:8095/config");
-                connection = (HttpURLConnection) endpoint.openConnection();
-                connection.setRequestMethod("POST");
-                connection.setConnectTimeout(1000);
-                connection.setReadTimeout(1000);
-                connection.setDoOutput(true);
-                connection.setRequestProperty("Content-Type", "application/json");
-                byte[] data = json.getBytes("UTF-8");
-                connection.setFixedLengthStreamingMode(data.length);
-                try (OutputStream output = connection.getOutputStream()) {
-                    output.write(data);
+                if (controlEndpoint != null && !controlEndpoint.isEmpty()) {
+                    URL endpoint = new URL(controlEndpoint);
+                    connection = (HttpURLConnection) endpoint.openConnection();
+                    connection.setRequestMethod("POST");
+                    connection.setConnectTimeout(1000);
+                    connection.setReadTimeout(1500);
+                    connection.setDoOutput(true);
+                    connection.setRequestProperty("Content-Type", "application/json");
+                    byte[] data = json.getBytes("UTF-8");
+                    connection.setFixedLengthStreamingMode(data.length);
+                    try (OutputStream output = connection.getOutputStream()) {
+                        output.write(data);
+                    }
+                    connection.getResponseCode();
                 }
-                connection.getResponseCode();
             } catch (Exception ignored) {
             } finally {
                 if (connection != null) {

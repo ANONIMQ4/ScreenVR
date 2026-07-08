@@ -9,11 +9,16 @@ import android.view.Surface;
 import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 public class RawH264Player {
+    private static final long INPUT_BUFFER_TIMEOUT_US = 1_000;
+    private static final long POST_QUEUE_DRAIN_TIMEOUT_US = 1_500;
+
     public interface DecoderStatsListener {
         void onDecoderStats(float readFps, float inputFps, float outputFps, float droppedOutputFps);
     }
@@ -21,6 +26,7 @@ public class RawH264Player {
     private volatile boolean running;
     private Thread worker;
     private Socket socket;
+    private DatagramSocket datagramSocket;
     private MediaCodec codec;
     private FrameLatencyTracker latencyTracker;
     private DecoderStatsListener decoderStatsListener;
@@ -65,12 +71,30 @@ public class RawH264Player {
         int width = parseInt(uri.getQueryParameter("w"), 960);
         int height = parseInt(uri.getQueryParameter("h"), 540);
         int fps = clampInt(parseInt(uri.getQueryParameter("fps"), 30), 10, 300);
+        if ("rtph264".equals(uri.getScheme())) {
+            playRtpLoop(port, surface, width, height, fps);
+            return;
+        }
         while (running) {
             try {
                 socket = new Socket(host, port);
                 socket.setTcpNoDelay(true);
                 socket.setReceiveBufferSize(256 * 1024);
                 readAnnexB(new BufferedInputStream(socket.getInputStream(), 256 * 1024), surface, width, height, fps);
+            } catch (Exception ignored) {
+                releaseCodec();
+                closeSocket();
+                sleepQuietly(200);
+            }
+        }
+    }
+
+    private void playRtpLoop(int port, Surface surface, int width, int height, int fps) {
+        while (running) {
+            try {
+                datagramSocket = new DatagramSocket(port);
+                datagramSocket.setReceiveBufferSize(512 * 1024);
+                readRtpH264(datagramSocket, surface, width, height, fps);
             } catch (Exception ignored) {
                 releaseCodec();
                 closeSocket();
@@ -117,9 +141,11 @@ public class RawH264Player {
                 readFramesInWindow++;
                 publishDecoderStatsIfNeeded();
                 if (codec != null) {
-                    drainOutput();
-                    queueAccessUnit(accessUnit.data(), accessUnit.size(), ptsUs);
-                    ptsUs += frameDurationUs;
+                    drainOutput(0);
+                    if (queueAccessUnit(accessUnit.data(), accessUnit.size(), ptsUs)) {
+                        ptsUs += frameDurationUs;
+                        drainOutput(POST_QUEUE_DRAIN_TIMEOUT_US);
+                    }
                 }
                 accessUnit.reset();
             }
@@ -136,6 +162,117 @@ public class RawH264Player {
                 }
             }
             accessUnit.write(nal);
+        }
+    }
+
+    private void readRtpH264(DatagramSocket udp, Surface surface, int width, int height, int fps) throws IOException {
+        byte[] packetData = new byte[2048];
+        DatagramPacket packet = new DatagramPacket(packetData, packetData.length);
+        ByteAccumulator accessUnit = new ByteAccumulator(512 * 1024);
+        byte[] sps = null;
+        byte[] pps = null;
+        long ptsUs = 0;
+        long frameDurationUs = 1_000_000L / Math.max(1, fps);
+        int expectedSeq = -1;
+        boolean corruptedAccessUnit = false;
+
+        while (running) {
+            udp.receive(packet);
+            int length = packet.getLength();
+            if (length < 13) {
+                continue;
+            }
+            int offset = packet.getOffset();
+            int version = (packetData[offset] >> 6) & 0x03;
+            if (version != 2) {
+                continue;
+            }
+            int csrcCount = packetData[offset] & 0x0f;
+            boolean hasExtension = (packetData[offset] & 0x10) != 0;
+            boolean marker = (packetData[offset + 1] & 0x80) != 0;
+            int seq = ((packetData[offset + 2] & 0xff) << 8) | (packetData[offset + 3] & 0xff);
+            int payloadOffset = offset + 12 + csrcCount * 4;
+            if (payloadOffset >= offset + length) {
+                continue;
+            }
+            if (hasExtension) {
+                if (payloadOffset + 4 > offset + length) {
+                    continue;
+                }
+                int extensionWords = ((packetData[payloadOffset + 2] & 0xff) << 8) | (packetData[payloadOffset + 3] & 0xff);
+                payloadOffset += 4 + extensionWords * 4;
+                if (payloadOffset >= offset + length) {
+                    continue;
+                }
+            }
+            if (expectedSeq >= 0 && seq != expectedSeq) {
+                corruptedAccessUnit = true;
+                accessUnit.reset();
+            }
+            expectedSeq = (seq + 1) & 0xffff;
+
+            int payloadLength = offset + length - payloadOffset;
+            int nalType = packetData[payloadOffset] & 0x1f;
+            if (nalType >= 1 && nalType <= 23) {
+                writeNal(accessUnit, packetData, payloadOffset, payloadLength);
+                if (nalType == 7) {
+                    sps = annexBNal(packetData, payloadOffset, payloadLength);
+                } else if (nalType == 8) {
+                    pps = annexBNal(packetData, payloadOffset, payloadLength);
+                }
+            } else if (nalType == 24) {
+                int stapOffset = payloadOffset + 1;
+                int stapEnd = payloadOffset + payloadLength;
+                while (stapOffset + 2 <= stapEnd) {
+                    int nalLength = ((packetData[stapOffset] & 0xff) << 8) | (packetData[stapOffset + 1] & 0xff);
+                    stapOffset += 2;
+                    if (nalLength <= 0 || stapOffset + nalLength > stapEnd) {
+                        corruptedAccessUnit = true;
+                        break;
+                    }
+                    int stapNalType = packetData[stapOffset] & 0x1f;
+                    writeNal(accessUnit, packetData, stapOffset, nalLength);
+                    if (stapNalType == 7) {
+                        sps = annexBNal(packetData, stapOffset, nalLength);
+                    } else if (stapNalType == 8) {
+                        pps = annexBNal(packetData, stapOffset, nalLength);
+                    }
+                    stapOffset += nalLength;
+                }
+            } else if (nalType == 28 && payloadLength >= 3) {
+                int fuIndicator = packetData[payloadOffset] & 0xff;
+                int fuHeader = packetData[payloadOffset + 1] & 0xff;
+                boolean start = (fuHeader & 0x80) != 0;
+                int reconstructedHeader = (fuIndicator & 0xe0) | (fuHeader & 0x1f);
+                if (start) {
+                    writeStartCode(accessUnit);
+                    accessUnit.write((byte) reconstructedHeader);
+                } else if (accessUnit.size() == 0) {
+                    corruptedAccessUnit = true;
+                }
+                accessUnit.write(packetData, payloadOffset + 2, payloadLength - 2);
+            } else {
+                corruptedAccessUnit = true;
+            }
+
+            if (marker) {
+                readFramesInWindow++;
+                publishDecoderStatsIfNeeded();
+                if (!corruptedAccessUnit && accessUnit.size() > 0) {
+                    if (codec == null && sps != null && pps != null) {
+                        codec = createCodec(surface, width, height, fps, sps, pps);
+                    }
+                    if (codec != null) {
+                        drainOutput(0);
+                        if (queueAccessUnit(accessUnit.data(), accessUnit.size(), ptsUs)) {
+                            ptsUs += frameDurationUs;
+                            drainOutput(POST_QUEUE_DRAIN_TIMEOUT_US);
+                        }
+                    }
+                }
+                accessUnit.reset();
+                corruptedAccessUnit = false;
+            }
         }
     }
 
@@ -157,19 +294,23 @@ public class RawH264Player {
         return -1;
     }
 
-    private void queueAccessUnit(byte[] data, int length, long ptsUs) {
+    private boolean queueAccessUnit(byte[] data, int length, long ptsUs) {
         MediaCodec current = codec;
         if (current == null) {
-            return;
+            return false;
         }
         try {
-            int index = current.dequeueInputBuffer(0);
+            int index = current.dequeueInputBuffer(INPUT_BUFFER_TIMEOUT_US);
             if (index < 0) {
-                return;
+                drainOutput(POST_QUEUE_DRAIN_TIMEOUT_US);
+                index = current.dequeueInputBuffer(0);
+                if (index < 0) {
+                    return false;
+                }
             }
             ByteBuffer inputBuffer = current.getInputBuffer(index);
             if (inputBuffer == null) {
-                return;
+                return false;
             }
             inputBuffer.clear();
             inputBuffer.put(data, 0, length);
@@ -180,26 +321,30 @@ public class RawH264Player {
             if (tracker != null) {
                 tracker.recordQueued(ptsUs, System.currentTimeMillis());
             }
+            return true;
         } catch (Exception ignored) {
             running = false;
+            return false;
         }
     }
 
-    private void drainOutput() {
+    private void drainOutput(long firstTimeoutUs) {
         MediaCodec current = codec;
         if (current == null) {
             return;
         }
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         int newestIndex = -1;
+        long timeoutUs = firstTimeoutUs;
         while (running) {
             int index;
             try {
-                index = current.dequeueOutputBuffer(info, 0);
+                index = current.dequeueOutputBuffer(info, timeoutUs);
             } catch (Exception ignored) {
                 running = false;
                 return;
             }
+            timeoutUs = 0;
             if (index >= 0) {
                 if (newestIndex >= 0) {
                     current.releaseOutputBuffer(newestIndex, false);
@@ -252,6 +397,10 @@ public class RawH264Player {
         } catch (IOException ignored) {
         }
         socket = null;
+        if (datagramSocket != null) {
+            datagramSocket.close();
+        }
+        datagramSocket = null;
     }
 
     private void releaseCodec() {
@@ -393,6 +542,17 @@ public class RawH264Player {
             size += bytes.length;
         }
 
+        void write(byte[] bytes, int offset, int length) {
+            ensureCapacity(size + length);
+            System.arraycopy(bytes, offset, data, size, length);
+            size += length;
+        }
+
+        void write(byte value) {
+            ensureCapacity(size + 1);
+            data[size++] = value;
+        }
+
         void reset() {
             size = 0;
         }
@@ -407,5 +567,27 @@ public class RawH264Player {
             }
             data = Arrays.copyOf(data, next);
         }
+    }
+
+    private static byte[] annexBNal(byte[] data, int offset, int length) {
+        byte[] nal = new byte[length + 4];
+        nal[0] = 0;
+        nal[1] = 0;
+        nal[2] = 0;
+        nal[3] = 1;
+        System.arraycopy(data, offset, nal, 4, length);
+        return nal;
+    }
+
+    private static void writeNal(ByteAccumulator accessUnit, byte[] data, int offset, int length) {
+        writeStartCode(accessUnit);
+        accessUnit.write(data, offset, length);
+    }
+
+    private static void writeStartCode(ByteAccumulator accessUnit) {
+        accessUnit.write((byte) 0);
+        accessUnit.write((byte) 0);
+        accessUnit.write((byte) 0);
+        accessUnit.write((byte) 1);
     }
 }
