@@ -22,6 +22,7 @@ import android.widget.TextView;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Locale;
 
 public class MainActivity extends Activity implements VrVideoView.VideoSurfaceListener {
     private static final String PREFS = "screen_vr_client";
@@ -33,7 +34,21 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private static final String BITRATE_KEY = "raw_bitrate";
     private static final String FIT_KEY = "raw_fit";
     private static final String EYE_OFFSET_KEY = "eye_offset";
-    private static final String DEFAULT_URL = "rawh264://127.0.0.1:8094?w=1170&h=1080";
+    private static final String LENS_MODE_KEY = "lens_mode";
+    private static final String LENS_STRENGTH_KEY = "lens_strength";
+    private static final String LENS_ZOOM_KEY = "lens_zoom";
+    private static final String LENS_CENTER_KEY = "lens_center";
+    private static final String LENS_SIZE_X_KEY = "lens_size_x";
+    private static final String LENS_SIZE_Y_KEY = "lens_size_y";
+    private static final String LENS_MASK_KEY = "lens_mask";
+    private static final int DEFAULT_LENS_MODE = 1;
+    private static final float DEFAULT_LENS_STRENGTH = 35f;
+    private static final float DEFAULT_LENS_ZOOM = 105f;
+    private static final float DEFAULT_LENS_CENTER = 3f;
+    private static final float DEFAULT_LENS_SIZE_X = 92f;
+    private static final float DEFAULT_LENS_SIZE_Y = 92f;
+    private static final int DEFAULT_LENS_MASK = 1;
+    private static final String DEFAULT_URL = "rawh264://127.0.0.1:8094?w=1170&h=1080&fps=30";
 
     private RawH264Player h264Player;
     private VrVideoView videoView;
@@ -44,11 +59,25 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private EditText fpsInput;
     private EditText bitrateInput;
     private EditText eyeOffsetInput;
+    private EditText lensStrengthInput;
+    private EditText zoomInput;
+    private EditText centerOffsetInput;
+    private EditText sizeXInput;
+    private EditText sizeYInput;
+    private TextView hintView;
+    private TextView statsView;
     private Button sbsButton;
     private Button fitButton;
+    private Button lensButton;
+    private Button maskButton;
     private Surface videoSurface;
     private String activeRawUrl;
     private Surface activeRawSurface;
+    private final FrameLatencyTracker latencyTracker = new FrameLatencyTracker();
+    private volatile float decoderReadFps;
+    private volatile float decoderInputFps;
+    private volatile float decoderOutputFps;
+    private volatile float decoderDroppedFps;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -64,8 +93,34 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
 
         videoView = new VrVideoView(this);
         videoView.setVideoSurfaceListener(this);
+        videoView.setLatencyTracker(latencyTracker);
+        videoView.setFrameStatsListener((fps, latencyMs, queuedFrames) -> runOnUiThread(() -> {
+            if (statsView != null) {
+                String latencyText = latencyMs >= 0 ? latencyMs + "ms" : "--ms";
+                statsView.setText(String.format(
+                        Locale.US,
+                        "gl %.1f  read %.1f  in %.1f  out %.1f  drop %.1f  lag %s  q %d",
+                        fps,
+                        decoderReadFps,
+                        decoderInputFps,
+                        decoderOutputFps,
+                        decoderDroppedFps,
+                        latencyText,
+                        queuedFrames
+                ));
+            }
+        }));
         videoView.setSbsMode(prefs.getBoolean(SBS_KEY, false));
         videoView.setEyeOffsetPercent(prefs.getInt(EYE_OFFSET_KEY, 0));
+        videoView.setLensSettings(
+                prefs.getInt(LENS_MODE_KEY, DEFAULT_LENS_MODE),
+                prefs.getFloat(LENS_STRENGTH_KEY, DEFAULT_LENS_STRENGTH),
+                prefs.getFloat(LENS_ZOOM_KEY, DEFAULT_LENS_ZOOM),
+                prefs.getFloat(LENS_CENTER_KEY, DEFAULT_LENS_CENTER),
+                prefs.getFloat(LENS_SIZE_X_KEY, DEFAULT_LENS_SIZE_X),
+                prefs.getFloat(LENS_SIZE_Y_KEY, DEFAULT_LENS_SIZE_Y),
+                prefs.getInt(LENS_MASK_KEY, DEFAULT_LENS_MASK)
+        );
         root.addView(videoView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -79,18 +134,33 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         );
         root.addView(controls, controlsParams);
 
-        TextView hint = new TextView(this);
-        hint.setText("Tap video to show controls");
-        hint.setTextColor(0x99ffffff);
-        hint.setTextSize(12);
-        hint.setGravity(Gravity.CENTER);
-        hint.setPadding(0, 16, 0, 0);
+        hintView = new TextView(this);
+        hintView.setText("Tap video to show controls");
+        hintView.setTextColor(0x99ffffff);
+        hintView.setTextSize(12);
+        hintView.setGravity(Gravity.CENTER);
+        hintView.setPadding(0, 16, 0, 0);
         FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP
         );
-        root.addView(hint, hintParams);
+        root.addView(hintView, hintParams);
+
+        statsView = new TextView(this);
+        statsView.setText("fps --");
+        statsView.setTextColor(0xccffffff);
+        statsView.setTextSize(12);
+        statsView.setGravity(Gravity.RIGHT);
+        statsView.setPadding(12, 8, 12, 8);
+        statsView.setBackgroundColor(0x66000000);
+        FrameLayout.LayoutParams statsParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.RIGHT
+        );
+        statsParams.setMargins(0, 12, 12, 0);
+        root.addView(statsView, statsParams);
 
         videoView.setOnClickListener(v -> toggleControls());
         setContentView(root);
@@ -117,7 +187,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         urlInput.setText(savedUrl);
         urlInput.setTextColor(0xffffffff);
         urlInput.setHintTextColor(0x88ffffff);
-        urlInput.setHint("rawh264://127.0.0.1:8094?w=1170&h=1080");
+        urlInput.setHint("rawh264://127.0.0.1:8094?w=1170&h=1080&fps=30");
         urlInput.setTextSize(14);
         urlInput.setSelectAllOnFocus(true);
         topRow.addView(urlInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
@@ -148,6 +218,7 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         hide.setOnClickListener(v -> {
             hideKeyboard();
             controls.setVisibility(View.GONE);
+            setOverlayVisible(false);
             hideSystemUi();
         });
         topRow.addView(hide);
@@ -195,6 +266,62 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         apply.setOnClickListener(v -> applyRawH264Settings());
         viewRow.addView(apply);
 
+        LinearLayout lensRow = new LinearLayout(this);
+        lensRow.setOrientation(LinearLayout.HORIZONTAL);
+        lensRow.setGravity(Gravity.CENTER_VERTICAL);
+        box.addView(lensRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
+        lensButton = new Button(this);
+        updateLensButton(prefs.getInt(LENS_MODE_KEY, DEFAULT_LENS_MODE));
+        lensButton.setOnClickListener(v -> {
+            int next = (lensModeFromButton() + 1) % 6;
+            updateLensButton(next);
+            applyLensSettings();
+            hideSystemUi();
+        });
+        lensRow.addView(lensButton);
+
+        lensStrengthInput = smallInput(formatFloat(prefs.getFloat(LENS_STRENGTH_KEY, DEFAULT_LENS_STRENGTH)), "Lens");
+        zoomInput = smallInput(formatFloat(prefs.getFloat(LENS_ZOOM_KEY, DEFAULT_LENS_ZOOM)), "Zoom");
+        centerOffsetInput = smallInput(formatFloat(prefs.getFloat(LENS_CENTER_KEY, DEFAULT_LENS_CENTER)), "Center");
+        lensRow.addView(lensStrengthInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        lensRow.addView(zoomInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        lensRow.addView(centerOffsetInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+        maskButton = new Button(this);
+        updateMaskButton(prefs.getInt(LENS_MASK_KEY, DEFAULT_LENS_MASK));
+        maskButton.setOnClickListener(v -> {
+            updateMaskButton(maskModeFromButton() == 0 ? 1 : 0);
+            applyLensSettings();
+            hideSystemUi();
+        });
+        lensRow.addView(maskButton);
+
+        LinearLayout sizeRow = new LinearLayout(this);
+        sizeRow.setOrientation(LinearLayout.HORIZONTAL);
+        sizeRow.setGravity(Gravity.CENTER_VERTICAL);
+        box.addView(sizeRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+
+        sizeXInput = smallInput(formatFloat(prefs.getFloat(LENS_SIZE_X_KEY, DEFAULT_LENS_SIZE_X)), "Size X");
+        sizeYInput = smallInput(formatFloat(prefs.getFloat(LENS_SIZE_Y_KEY, DEFAULT_LENS_SIZE_Y)), "Size Y");
+        sizeRow.addView(sizeXInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        sizeRow.addView(sizeYInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+        Button lensApply = new Button(this);
+        lensApply.setText("Lens apply");
+        lensApply.setOnClickListener(v -> {
+            applyLensSettings();
+            hideKeyboard();
+            hideSystemUi();
+        });
+        sizeRow.addView(lensApply);
+
         return box;
     }
 
@@ -207,18 +334,27 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         input.setHintTextColor(0x88ffffff);
         input.setTextSize(13);
         input.setSelectAllOnFocus(true);
-        input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER
+                | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                | android.text.InputType.TYPE_NUMBER_FLAG_SIGNED);
         return input;
     }
 
     private void applyRawH264Settings() {
         int width = parseInt(widthInput.getText().toString(), 1170);
         int height = parseInt(heightInput.getText().toString(), 1080);
-        int fps = parseInt(fpsInput.getText().toString(), 30);
+        int fps = clampInt(parseInt(fpsInput.getText().toString(), 30), 10, 300);
         int bitrate = parseInt(bitrateInput.getText().toString(), 5000);
         int eyeOffset = clampInt(parseInt(eyeOffsetInput.getText().toString(), 0), 0, 5);
+        int lensMode = lensModeFromButton();
+        float lensStrength = clampFloat(parseFloat(lensStrengthInput.getText().toString(), 0f), 0f, 100f);
+        float zoom = clampFloat(parseFloat(zoomInput.getText().toString(), 100f), 50f, 200f);
+        float centerOffset = clampFloat(parseFloat(centerOffsetInput.getText().toString(), 0f), -20f, 20f);
+        float sizeX = clampFloat(parseFloat(sizeXInput.getText().toString(), 100f), 50f, 150f);
+        float sizeY = clampFloat(parseFloat(sizeYInput.getText().toString(), 100f), 50f, 150f);
+        int maskMode = maskModeFromButton();
         String fit = fitButton.getText().toString().toLowerCase();
-        String url = "rawh264://127.0.0.1:8094?w=" + width + "&h=" + height;
+        String url = "rawh264://127.0.0.1:8094?w=" + width + "&h=" + height + "&fps=" + fps;
 
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putInt(WIDTH_KEY, width)
@@ -226,15 +362,54 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
                 .putInt(FPS_KEY, fps)
                 .putInt(BITRATE_KEY, bitrate)
                 .putInt(EYE_OFFSET_KEY, eyeOffset)
+                .putInt(LENS_MODE_KEY, lensMode)
+                .putFloat(LENS_STRENGTH_KEY, lensStrength)
+                .putFloat(LENS_ZOOM_KEY, zoom)
+                .putFloat(LENS_CENTER_KEY, centerOffset)
+                .putFloat(LENS_SIZE_X_KEY, sizeX)
+                .putFloat(LENS_SIZE_Y_KEY, sizeY)
+                .putInt(LENS_MASK_KEY, maskMode)
                 .putString(FIT_KEY, fit)
                 .putString(URL_KEY, url)
                 .apply();
 
         eyeOffsetInput.setText(String.valueOf(eyeOffset));
+        fpsInput.setText(String.valueOf(fps));
         videoView.setEyeOffsetPercent(eyeOffset);
+        lensStrengthInput.setText(formatFloat(lensStrength));
+        zoomInput.setText(formatFloat(zoom));
+        centerOffsetInput.setText(formatFloat(centerOffset));
+        sizeXInput.setText(formatFloat(sizeX));
+        sizeYInput.setText(formatFloat(sizeY));
+        videoView.setLensSettings(lensMode, lensStrength, zoom, centerOffset, sizeX, sizeY, maskMode);
         urlInput.setText(url);
         hideKeyboard();
         sendRawH264Config(width, height, fps, bitrate, fit, url);
+    }
+
+    private void applyLensSettings() {
+        int lensMode = lensModeFromButton();
+        float lensStrength = clampFloat(parseFloat(lensStrengthInput.getText().toString(), 0f), 0f, 100f);
+        float zoom = clampFloat(parseFloat(zoomInput.getText().toString(), 100f), 50f, 200f);
+        float centerOffset = clampFloat(parseFloat(centerOffsetInput.getText().toString(), 0f), -20f, 20f);
+        float sizeX = clampFloat(parseFloat(sizeXInput.getText().toString(), 100f), 50f, 150f);
+        float sizeY = clampFloat(parseFloat(sizeYInput.getText().toString(), 100f), 50f, 150f);
+        int maskMode = maskModeFromButton();
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putInt(LENS_MODE_KEY, lensMode)
+                .putFloat(LENS_STRENGTH_KEY, lensStrength)
+                .putFloat(LENS_ZOOM_KEY, zoom)
+                .putFloat(LENS_CENTER_KEY, centerOffset)
+                .putFloat(LENS_SIZE_X_KEY, sizeX)
+                .putFloat(LENS_SIZE_Y_KEY, sizeY)
+                .putInt(LENS_MASK_KEY, maskMode)
+                .apply();
+        lensStrengthInput.setText(formatFloat(lensStrength));
+        zoomInput.setText(formatFloat(zoom));
+        centerOffsetInput.setText(formatFloat(centerOffset));
+        sizeXInput.setText(formatFloat(sizeX));
+        sizeYInput.setText(formatFloat(sizeY));
+        videoView.setLensSettings(lensMode, lensStrength, zoom, centerOffset, sizeX, sizeY, maskMode);
     }
 
     private void sendRawH264Config(int width, int height, int fps, int bitrate, String fit, String streamUrl) {
@@ -275,7 +450,19 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         if (url == null || url.isEmpty()) {
             return;
         }
-        startRawH264(url);
+        startRawH264(withFpsParameter(url));
+    }
+
+    private String withFpsParameter(String url) {
+        Uri uri = Uri.parse(url);
+        if (uri.getQueryParameter("fps") != null) {
+            return url;
+        }
+        int fps = fpsInput != null
+                ? clampInt(parseInt(fpsInput.getText().toString(), 30), 10, 300)
+                : 30;
+        String separator = url.contains("?") ? "&" : "?";
+        return url + separator + "fps=" + fps;
     }
 
     private void startRawH264(String url) {
@@ -285,6 +472,13 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         videoView.setVisibility(View.VISIBLE);
         if (h264Player == null) {
             h264Player = new RawH264Player();
+            h264Player.setLatencyTracker(latencyTracker);
+            h264Player.setDecoderStatsListener((readFps, inputFps, outputFps, droppedFps) -> {
+                decoderReadFps = readFps;
+                decoderInputFps = inputFps;
+                decoderOutputFps = outputFps;
+                decoderDroppedFps = droppedFps;
+            });
         }
         Uri uri = Uri.parse(url);
         int width = parseInt(uri.getQueryParameter("w"), 16);
@@ -316,13 +510,90 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         }
     }
 
+    private float parseFloat(String value, float fallback) {
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return Float.parseFloat(value);
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
     private int clampInt(int value, int minimum, int maximum) {
         return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private float clampFloat(float value, float minimum, float maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private String formatFloat(float value) {
+        if (Math.abs(value - Math.round(value)) < 0.05f) {
+            return String.valueOf(Math.round(value));
+        }
+        return String.format(Locale.US, "%.1f", value);
     }
 
     private void updateSbsButton() {
         if (sbsButton != null) {
             sbsButton.setText(videoView != null && videoView.isSbsMode() ? "Flat" : "SBS");
+        }
+    }
+
+    private int lensModeFromButton() {
+        if (lensButton == null) {
+            return 0;
+        }
+        CharSequence text = lensButton.getText();
+        if ("Barrel".contentEquals(text)) {
+            return 1;
+        }
+        if ("Barrel+".contentEquals(text)) {
+            return 2;
+        }
+        if ("Pin".contentEquals(text)) {
+            return 3;
+        }
+        if ("Fish".contentEquals(text)) {
+            return 4;
+        }
+        if ("Soft".contentEquals(text)) {
+            return 5;
+        }
+        return 0;
+    }
+
+    private void updateLensButton(int mode) {
+        if (lensButton == null) {
+            return;
+        }
+        if (mode == 1) {
+            lensButton.setText("Barrel");
+        } else if (mode == 2) {
+            lensButton.setText("Barrel+");
+        } else if (mode == 3) {
+            lensButton.setText("Pin");
+        } else if (mode == 4) {
+            lensButton.setText("Fish");
+        } else if (mode == 5) {
+            lensButton.setText("Soft");
+        } else {
+            lensButton.setText("Lens off");
+        }
+    }
+
+    private int maskModeFromButton() {
+        if (maskButton == null) {
+            return DEFAULT_LENS_MASK;
+        }
+        return "Mask YT".contentEquals(maskButton.getText()) ? 1 : 0;
+    }
+
+    private void updateMaskButton(int mode) {
+        if (maskButton != null) {
+            maskButton.setText(mode == 1 ? "Mask YT" : "Mask off");
         }
     }
 
@@ -344,8 +615,20 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     }
 
     private void toggleControls() {
-        controls.setVisibility(controls.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        boolean show = controls.getVisibility() != View.VISIBLE;
+        controls.setVisibility(show ? View.VISIBLE : View.GONE);
+        setOverlayVisible(show);
         hideSystemUi();
+    }
+
+    private void setOverlayVisible(boolean visible) {
+        int visibility = visible ? View.VISIBLE : View.GONE;
+        if (hintView != null) {
+            hintView.setVisibility(visibility);
+        }
+        if (statsView != null) {
+            statsView.setVisibility(visibility);
+        }
     }
 
     private void hideKeyboard() {

@@ -22,6 +22,10 @@ public class VrVideoView extends GLSurfaceView {
         void onVideoSurfaceDestroyed(Surface surface);
     }
 
+    public interface FrameStatsListener {
+        void onFrameStats(float fps, long latencyMs, int queuedFrames);
+    }
+
     private final VideoRenderer renderer;
 
     public VrVideoView(Context context) {
@@ -35,6 +39,14 @@ public class VrVideoView extends GLSurfaceView {
 
     public void setVideoSurfaceListener(VideoSurfaceListener listener) {
         renderer.setVideoSurfaceListener(listener);
+    }
+
+    public void setFrameStatsListener(FrameStatsListener listener) {
+        renderer.setFrameStatsListener(listener);
+    }
+
+    public void setLatencyTracker(FrameLatencyTracker tracker) {
+        renderer.setLatencyTracker(tracker);
     }
 
     public void setSbsMode(boolean enabled) {
@@ -56,6 +68,27 @@ public class VrVideoView extends GLSurfaceView {
         requestRender();
     }
 
+    public void setLensSettings(
+            int mode,
+            float strengthPercent,
+            float zoomPercent,
+            float centerOffsetPercent,
+            float sizeXPercent,
+            float sizeYPercent,
+            int maskMode
+    ) {
+        renderer.setLensSettings(
+                mode,
+                strengthPercent,
+                zoomPercent,
+                centerOffsetPercent,
+                sizeXPercent,
+                sizeYPercent,
+                maskMode
+        );
+        requestRender();
+    }
+
     private static final class VideoRenderer implements Renderer, SurfaceTexture.OnFrameAvailableListener {
         private final GLSurfaceView view;
         private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -74,6 +107,8 @@ public class VrVideoView extends GLSurfaceView {
         });
 
         private VideoSurfaceListener listener;
+        private FrameStatsListener frameStatsListener;
+        private FrameLatencyTracker latencyTracker;
         private SurfaceTexture surfaceTexture;
         private Surface surface;
         private int textureId;
@@ -83,12 +118,30 @@ public class VrVideoView extends GLSurfaceView {
         private int uTexture;
         private int uSTMatrix;
         private int uEyeOffset;
+        private int uEyeSide;
+        private int uLensMode;
+        private int uLensStrength;
+        private int uZoom;
+        private int uCenterOffset;
+        private int uSize;
+        private int uMaskMode;
         private int width;
         private int height;
         private volatile boolean frameAvailable;
         private volatile boolean sbsMode;
         private volatile float videoAspect = 16f / 9f;
         private volatile float eyeOffsetPercent;
+        private volatile int lensMode;
+        private volatile float lensStrength;
+        private volatile float zoom = 1f;
+        private volatile float centerOffset;
+        private volatile float sizeX = 1f;
+        private volatile float sizeY = 1f;
+        private volatile int maskMode = 1;
+        private long statsWindowStartedMs;
+        private int drawnInWindow;
+        private long latestLatencyMs = -1;
+        private int latestQueuedFrames;
 
         VideoRenderer(GLSurfaceView view) {
             this.view = view;
@@ -99,6 +152,14 @@ public class VrVideoView extends GLSurfaceView {
             if (surface != null && listener != null) {
                 mainHandler.post(() -> listener.onVideoSurfaceReady(surface));
             }
+        }
+
+        void setFrameStatsListener(FrameStatsListener listener) {
+            frameStatsListener = listener;
+        }
+
+        void setLatencyTracker(FrameLatencyTracker tracker) {
+            latencyTracker = tracker;
         }
 
         void setSbsMode(boolean enabled) {
@@ -119,6 +180,24 @@ public class VrVideoView extends GLSurfaceView {
             eyeOffsetPercent = Math.max(0f, Math.min(5f, percent));
         }
 
+        void setLensSettings(
+                int mode,
+                float strengthPercent,
+                float zoomPercent,
+                float centerOffsetPercent,
+                float sizeXPercent,
+                float sizeYPercent,
+                int maskMode
+        ) {
+            lensMode = Math.max(0, Math.min(5, mode));
+            lensStrength = Math.max(0f, Math.min(100f, strengthPercent)) / 100f;
+            zoom = Math.max(0.5f, Math.min(2.0f, zoomPercent / 100f));
+            centerOffset = Math.max(-20f, Math.min(20f, centerOffsetPercent)) / 100f;
+            sizeX = Math.max(0.5f, Math.min(1.5f, sizeXPercent / 100f));
+            sizeY = Math.max(0.5f, Math.min(1.5f, sizeYPercent / 100f));
+            this.maskMode = Math.max(0, Math.min(1, maskMode));
+        }
+
         @Override
         public void onSurfaceCreated(GL10 gl, EGLConfig config) {
             program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER);
@@ -127,6 +206,13 @@ public class VrVideoView extends GLSurfaceView {
             uTexture = GLES20.glGetUniformLocation(program, "uTexture");
             uSTMatrix = GLES20.glGetUniformLocation(program, "uSTMatrix");
             uEyeOffset = GLES20.glGetUniformLocation(program, "uEyeOffset");
+            uEyeSide = GLES20.glGetUniformLocation(program, "uEyeSide");
+            uLensMode = GLES20.glGetUniformLocation(program, "uLensMode");
+            uLensStrength = GLES20.glGetUniformLocation(program, "uLensStrength");
+            uZoom = GLES20.glGetUniformLocation(program, "uZoom");
+            uCenterOffset = GLES20.glGetUniformLocation(program, "uCenterOffset");
+            uSize = GLES20.glGetUniformLocation(program, "uSize");
+            uMaskMode = GLES20.glGetUniformLocation(program, "uMaskMode");
 
             textureId = createExternalTexture();
             surfaceTexture = new SurfaceTexture(textureId);
@@ -149,11 +235,22 @@ public class VrVideoView extends GLSurfaceView {
             if (surfaceTexture == null) {
                 return;
             }
+            boolean textureUpdated = false;
             if (frameAvailable) {
                 synchronized (this) {
                     frameAvailable = false;
                     surfaceTexture.updateTexImage();
                     surfaceTexture.getTransformMatrix(stMatrix);
+                    FrameLatencyTracker tracker = latencyTracker;
+                    if (tracker != null) {
+                        FrameLatencyTracker.Stats stats = tracker.recordDrawn(
+                                surfaceTexture.getTimestamp(),
+                                System.currentTimeMillis()
+                        );
+                        latestLatencyMs = stats.latencyMs;
+                        latestQueuedFrames = stats.queuedFrames;
+                    }
+                    textureUpdated = true;
                 }
             }
 
@@ -161,10 +258,18 @@ public class VrVideoView extends GLSurfaceView {
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             if (sbsMode) {
                 float offset = eyeOffsetPercent / 100f;
-                drawFitted(0, 0, width / 2, height, -offset);
-                drawFitted(width / 2, 0, width - width / 2, height, offset);
+                if (maskMode == 1) {
+                    drawYoutubeEye(0, 0, width / 2, height, -offset, -1f);
+                    drawYoutubeEye(width / 2, 0, width - width / 2, height, offset, 1f);
+                } else {
+                    drawFitted(0, 0, width / 2, height, -offset, -1f);
+                    drawFitted(width / 2, 0, width - width / 2, height, offset, 1f);
+                }
             } else {
-                drawFitted(0, 0, width, height, 0f);
+                drawFitted(0, 0, width, height, 0f, 0f);
+            }
+            if (textureUpdated) {
+                recordDrawnFrame();
             }
         }
 
@@ -174,7 +279,7 @@ public class VrVideoView extends GLSurfaceView {
             view.requestRender();
         }
 
-        private void drawFitted(int x, int y, int viewportWidth, int viewportHeight, float eyeOffset) {
+        private void drawFitted(int x, int y, int viewportWidth, int viewportHeight, float eyeOffset, float eyeSide) {
             int drawWidth = viewportWidth;
             int drawHeight = Math.round(viewportWidth / videoAspect);
             if (drawHeight > viewportHeight) {
@@ -184,16 +289,35 @@ public class VrVideoView extends GLSurfaceView {
             int drawX = x + (viewportWidth - drawWidth) / 2;
             int drawY = y + (viewportHeight - drawHeight) / 2;
             GLES20.glViewport(drawX, drawY, drawWidth, drawHeight);
-            drawTexture(eyeOffset);
+            drawTexture(eyeOffset, eyeSide);
         }
 
-        private void drawTexture(float eyeOffset) {
+        private void drawYoutubeEye(int x, int y, int viewportWidth, int viewportHeight, float eyeOffset, float eyeSide) {
+            int drawWidth = Math.round(viewportWidth * 0.864f);
+            int drawHeight = Math.round(viewportHeight * 0.972f);
+            int inward = Math.round(viewportWidth * 0.142f);
+            int drawX = eyeSide < 0f
+                    ? x + inward
+                    : x + viewportWidth - drawWidth - inward;
+            int drawY = y + Math.round(viewportHeight * 0.026f);
+            GLES20.glViewport(drawX, drawY, drawWidth, drawHeight);
+            drawTexture(eyeOffset, eyeSide);
+        }
+
+        private void drawTexture(float eyeOffset, float eyeSide) {
             GLES20.glUseProgram(program);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
             GLES20.glUniform1i(uTexture, 0);
             GLES20.glUniformMatrix4fv(uSTMatrix, 1, false, stMatrix, 0);
             GLES20.glUniform1f(uEyeOffset, eyeOffset);
+            GLES20.glUniform1f(uEyeSide, eyeSide);
+            GLES20.glUniform1i(uLensMode, lensMode);
+            GLES20.glUniform1f(uLensStrength, lensStrength);
+            GLES20.glUniform1f(uZoom, zoom);
+            GLES20.glUniform1f(uCenterOffset, centerOffset);
+            GLES20.glUniform2f(uSize, sizeX, sizeY);
+            GLES20.glUniform1i(uMaskMode, maskMode);
 
             vertexBuffer.position(0);
             GLES20.glEnableVertexAttribArray(aPosition);
@@ -206,6 +330,23 @@ public class VrVideoView extends GLSurfaceView {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
             GLES20.glDisableVertexAttribArray(aPosition);
             GLES20.glDisableVertexAttribArray(aTexCoord);
+        }
+
+        private void recordDrawnFrame() {
+            long now = System.currentTimeMillis();
+            if (statsWindowStartedMs == 0) {
+                statsWindowStartedMs = now;
+            }
+            drawnInWindow++;
+            long elapsed = now - statsWindowStartedMs;
+            if (elapsed >= 1000) {
+                FrameStatsListener listener = frameStatsListener;
+                if (listener != null) {
+                    listener.onFrameStats(drawnInWindow * 1000f / elapsed, latestLatencyMs, latestQueuedFrames);
+                }
+                drawnInWindow = 0;
+                statsWindowStartedMs = now;
+            }
         }
 
         private static int createExternalTexture() {
@@ -274,10 +415,60 @@ public class VrVideoView extends GLSurfaceView {
                 "precision mediump float;\n" +
                 "uniform samplerExternalOES uTexture;\n" +
                 "uniform float uEyeOffset;\n" +
+                "uniform float uEyeSide;\n" +
+                "uniform int uLensMode;\n" +
+                "uniform float uLensStrength;\n" +
+                "uniform float uZoom;\n" +
+                "uniform float uCenterOffset;\n" +
+                "uniform vec2 uSize;\n" +
+                "uniform int uMaskMode;\n" +
                 "varying vec2 vTexCoord;\n" +
                 "void main() {\n" +
-                "  vec2 shifted = vec2(clamp(vTexCoord.x + uEyeOffset, 0.0, 1.0), vTexCoord.y);\n" +
-                "  gl_FragColor = texture2D(uTexture, shifted);\n" +
+                "  vec2 maskP = vTexCoord - vec2(0.5, 0.5);\n" +
+                "  if (uMaskMode == 1) {\n" +
+                "    float ay = abs(maskP.y) / 0.5;\n" +
+                "    float ax = abs(maskP.x) / 0.5;\n" +
+                "    float halfW = 0.485 - (0.105 * pow(ay, 1.65));\n" +
+                "    float halfH = 0.462 - (0.050 * pow(ax, 1.85));\n" +
+                "    float edgeX = halfW - abs(maskP.x);\n" +
+                "    float edgeY = halfH - abs(maskP.y);\n" +
+                "    float alpha = smoothstep(0.0, 0.012, min(edgeX, edgeY));\n" +
+                "    if (alpha <= 0.001) {\n" +
+                "      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n" +
+                "      return;\n" +
+                "    }\n" +
+                "  }\n" +
+                "  vec2 p = (vTexCoord - vec2(0.5, 0.5)) / max(uSize, vec2(0.01, 0.01));\n" +
+                "  p = p / max(uZoom, 0.01);\n" +
+                "  float r2 = dot(p, p);\n" +
+                "  float factor = 1.0;\n" +
+                "  if (uLensMode == 1) {\n" +
+                "    factor = 1.0 + (0.55 * uLensStrength * r2) + (0.20 * uLensStrength * r2 * r2);\n" +
+                "  } else if (uLensMode == 2) {\n" +
+                "    factor = 1.0 + (0.85 * uLensStrength * r2) + (0.55 * uLensStrength * r2 * r2);\n" +
+                "  } else if (uLensMode == 3) {\n" +
+                "    factor = max(0.2, 1.0 - (0.45 * uLensStrength * r2));\n" +
+                "  } else if (uLensMode == 4) {\n" +
+                "    float r = sqrt(r2);\n" +
+                "    factor = 1.0 + (sin(min(r, 1.5708)) / max(r, 0.001) - 1.0) * uLensStrength;\n" +
+                "  } else if (uLensMode == 5) {\n" +
+                "    factor = 1.0 + (0.25 * uLensStrength * r2);\n" +
+                "  }\n" +
+                "  vec2 coord = vec2(0.5, 0.5) + p * factor;\n" +
+                "  coord.x += uEyeOffset - (uEyeSide * uCenterOffset);\n" +
+                "  coord = clamp(coord, vec2(0.0, 0.0), vec2(1.0, 1.0));\n" +
+                "  vec4 color = texture2D(uTexture, coord);\n" +
+                "  if (uMaskMode == 1) {\n" +
+                "    float ay = abs(maskP.y) / 0.5;\n" +
+                "    float ax = abs(maskP.x) / 0.5;\n" +
+                "    float halfW = 0.485 - (0.105 * pow(ay, 1.65));\n" +
+                "    float halfH = 0.462 - (0.050 * pow(ax, 1.85));\n" +
+                "    float edgeX = halfW - abs(maskP.x);\n" +
+                "    float edgeY = halfH - abs(maskP.y);\n" +
+                "    float alpha = smoothstep(0.0, 0.012, min(edgeX, edgeY));\n" +
+                "    color.rgb *= alpha;\n" +
+                "  }\n" +
+                "  gl_FragColor = color;\n" +
                 "}\n";
     }
 }

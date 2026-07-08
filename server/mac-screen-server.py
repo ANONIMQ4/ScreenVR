@@ -8,10 +8,54 @@ import socket
 import signal
 import subprocess
 import threading
+import time
 
 active_lock = threading.Lock()
 active_conn = None
-active_proc = None
+active_procs = []
+
+
+class H264StreamStats:
+    def __init__(self):
+        self.tail = b""
+        self.aud_count = 0
+        self.slice_count = 0
+        self.byte_count = 0
+        self.last_report = time.monotonic()
+
+    def add(self, chunk):
+        self.byte_count += len(chunk)
+        data = self.tail + chunk
+        tail_len = len(self.tail)
+        index = 0
+        while True:
+            start = data.find(b"\x00\x00\x01", index)
+            if start < 0:
+                break
+            header_index = start + 3
+            if header_index >= tail_len and header_index < len(data):
+                nal_type = data[header_index] & 0x1F
+                if nal_type == 9:
+                    self.aud_count += 1
+                elif nal_type in (1, 5):
+                    self.slice_count += 1
+            index = header_index + 1
+        self.tail = data[-5:]
+        self.report_if_due()
+
+    def report_if_due(self):
+        now = time.monotonic()
+        elapsed = now - self.last_report
+        if elapsed < 1:
+            return
+        aud_fps = self.aud_count / elapsed
+        slice_fps = self.slice_count / elapsed
+        mbps = (self.byte_count * 8 / 1_000_000) / elapsed
+        print(f"h264 aud {aud_fps:.1f} slice {slice_fps:.1f} send {mbps:.2f} Mbit/s", flush=True)
+        self.aud_count = 0
+        self.slice_count = 0
+        self.byte_count = 0
+        self.last_report = now
 
 
 def parse_args():
@@ -23,6 +67,9 @@ def parse_args():
     parser.add_argument("--size", default="960x540")
     parser.add_argument("--bitrate", default="2500k")
     parser.add_argument("--fit", choices=("contain", "cover"), default="contain")
+    parser.add_argument("--encoder", choices=("cpu", "videotoolbox"), default="cpu")
+    parser.add_argument("--capture-backend", choices=("avfoundation", "screencapturekit"), default="avfoundation")
+    parser.add_argument("--capture-cursor", choices=("0", "1"), default="0")
     return parser.parse_args()
 
 
@@ -35,6 +82,9 @@ class StreamConfig:
         self.fps = int(args.fps)
         self.bitrate = str(args.bitrate)
         self.fit = str(args.fit)
+        self.encoder = str(args.encoder)
+        self.capture_backend = str(args.capture_backend)
+        self.capture_cursor = str(args.capture_cursor)
 
     def snapshot(self):
         with self.lock:
@@ -44,13 +94,16 @@ class StreamConfig:
                 "fps": self.fps,
                 "bitrate": self.bitrate,
                 "fit": self.fit,
+                "encoder": self.encoder,
+                "capture_backend": self.capture_backend,
+                "capture_cursor": self.capture_cursor,
             }
 
     def update(self, payload):
         with self.lock:
             self.width = clamp_int(payload.get("width", self.width), 320, 2340)
             self.height = clamp_int(payload.get("height", self.height), 180, 2160)
-            self.fps = clamp_int(payload.get("fps", self.fps), 10, 60)
+            self.fps = clamp_int(payload.get("fps", self.fps), 10, 300)
             bitrate = clamp_int(payload.get("bitrate", int(str(self.bitrate).rstrip("k"))), 300, 25000)
             self.bitrate = f"{bitrate}k"
             fit = str(payload.get("fit", self.fit)).lower()
@@ -79,56 +132,160 @@ def ffmpeg_cmd(config):
     height = str(config["height"])
     fps = int(config["fps"])
     bitrate = str(config["bitrate"])
+    encoder = str(config.get("encoder", "cpu"))
+    capture_backend = str(config.get("capture_backend", "avfoundation"))
+    capture_cursor = str(config.get("capture_cursor", "0"))
     if config["fit"] == "cover":
-        video_filter = (
-            f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setpts=N/({fps}*TB)"
-        )
+        if encoder == "cpu":
+            video_filter = (
+                f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},setpts=N/({fps}*TB)"
+            )
+        else:
+            video_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}"
+            )
     else:
-        video_filter = (
-            f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setpts=N/({fps}*TB)"
-        )
-    return [
+        if encoder == "cpu":
+            video_filter = (
+                f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setpts=N/({fps}*TB)"
+            )
+        else:
+            video_filter = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            )
+    if capture_backend == "screencapturekit":
+        cmd = [
+            ffmpeg_path(),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            f"{width}x{height}",
+            "-framerate",
+            str(fps),
+            "-i",
+            "pipe:0",
+            "-an",
+        ]
+    else:
+        cmd = [
         ffmpeg_path(),
         "-hide_banner",
+        "-stats",
+        "-stats_period",
+        "1",
         "-loglevel",
         "warning",
         "-f",
         "avfoundation",
+        "-framerate",
+        str(fps),
+        "-pixel_format",
+        "nv12",
         "-capture_cursor",
-        "1",
+        capture_cursor,
         "-i",
         "1:none",
         "-vf",
         video_filter,
         "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        bitrate,
-        "-maxrate",
-        bitrate,
-        "-bufsize",
-        bitrate,
-        "-g",
-        str(fps),
-        "-bf",
-        "0",
-        "-x264-params",
-        f"keyint={fps}:min-keyint={fps}:scenecut=0:repeat-headers=1",
+        ]
+    if encoder == "videotoolbox":
+        cmd += [
+            "-c:v",
+            "h264_videotoolbox",
+            "-profile:v",
+            "baseline",
+            "-realtime",
+            "1",
+            "-prio_speed",
+            "1",
+            "-pix_fmt",
+            "nv12",
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            bitrate,
+            "-bufsize",
+            bitrate,
+            "-g",
+            str(fps),
+            "-bf",
+            "0",
+        ]
+    else:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            bitrate,
+            "-bufsize",
+            bitrate,
+            "-g",
+            str(fps),
+            "-bf",
+            "0",
+            "-x264-params",
+            f"keyint={fps}:min-keyint={fps}:scenecut=0:repeat-headers=1",
+        ]
+    cmd += [
         "-bsf:v",
         "h264_metadata=aud=insert",
         "-f",
         "h264",
         "pipe:1",
     ]
+    return cmd
+
+
+def sck_cmd(config):
+    ensure_sck_capture()
+    return [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "sck-capture"),
+        "--width",
+        str(config["width"]),
+        "--height",
+        str(config["height"]),
+        "--fps",
+        str(config["fps"]),
+    ]
+
+
+def ensure_sck_capture():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(script_dir, "sck-capture.swift")
+    binary = os.path.join(script_dir, "sck-capture")
+    if os.path.exists(binary) and os.path.getmtime(binary) >= os.path.getmtime(source):
+        return
+    swiftc = shutil.which("swiftc") or "/usr/bin/swiftc"
+    subprocess.check_call([
+        swiftc,
+        source,
+        "-framework",
+        "ScreenCaptureKit",
+        "-framework",
+        "CoreMedia",
+        "-framework",
+        "CoreVideo",
+        "-o",
+        binary,
+    ])
 
 
 def ffmpeg_path():
@@ -150,7 +307,7 @@ def ffmpeg_path():
 
 
 def close_active():
-    global active_conn, active_proc
+    global active_conn, active_procs
     with active_lock:
         if active_conn is not None:
             try:
@@ -158,19 +315,9 @@ def close_active():
             except OSError:
                 pass
             active_conn = None
-        if active_proc is not None:
-            try:
-                active_proc.terminate()
-                active_proc.wait(timeout=1)
-            except OSError:
-                pass
-            except subprocess.TimeoutExpired:
-                active_proc.kill()
-                try:
-                    active_proc.wait(timeout=1)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-            active_proc = None
+        for proc in reversed(active_procs):
+            stop_process(proc)
+        active_procs = []
 
 
 def kill_stale_ffmpeg():
@@ -193,31 +340,44 @@ def kill_stale_ffmpeg():
 
 
 def pipe_to_client(conn, config_store):
-    global active_conn, active_proc
+    global active_conn, active_procs
     config = config_store.snapshot()
     print(f"client connected: {config}", flush=True)
     close_active()
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    proc = subprocess.Popen(ffmpeg_cmd(config), stdout=subprocess.PIPE, bufsize=0)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+    capture_proc = None
+    if config.get("capture_backend") == "screencapturekit":
+        capture_proc = subprocess.Popen(sck_cmd(config), stdout=subprocess.PIPE, bufsize=0)
+        proc = subprocess.Popen(ffmpeg_cmd(config), stdin=capture_proc.stdout, stdout=subprocess.PIPE, bufsize=0)
+        if capture_proc.stdout is not None:
+            capture_proc.stdout.close()
+        procs = [capture_proc, proc]
+    else:
+        proc = subprocess.Popen(ffmpeg_cmd(config), stdout=subprocess.PIPE, bufsize=0)
+        procs = [proc]
     with active_lock:
         active_conn = conn
-        active_proc = proc
+        active_procs = procs
+    stats = H264StreamStats()
     try:
         while True:
             chunk = proc.stdout.read(32768)
             if not chunk:
                 break
+            stats.add(chunk)
             conn.sendall(chunk)
     except OSError:
         pass
     finally:
-        stop_process(proc)
+        for active in reversed(procs):
+            stop_process(active)
         conn.close()
         with active_lock:
             if active_conn is conn:
                 active_conn = None
-            if active_proc is proc:
-                active_proc = None
+            if active_procs == procs:
+                active_procs = []
         print("client disconnected", flush=True)
 
 
@@ -277,7 +437,11 @@ def main():
     config_store = StreamConfig(args)
     start_control_server(args.host, args.control_port, config_store)
     initial = config_store.snapshot()
-    print(f"Serving raw H.264 on rawh264://{args.host}:{args.port}?w={initial['width']}&h={initial['height']}", flush=True)
+    print(
+        f"Serving raw H.264 on rawh264://{args.host}:{args.port}"
+        f"?w={initial['width']}&h={initial['height']}&fps={initial['fps']}",
+        flush=True,
+    )
     print(f"Control endpoint on http://{args.host}:{args.control_port}/config", flush=True)
     print(f"For USB mode run: adb reverse tcp:{args.port} tcp:{args.port}", flush=True)
     print(f"For controls run: adb reverse tcp:{args.control_port} tcp:{args.control_port}", flush=True)
