@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--bitrate", default="3000k")
     parser.add_argument("--duration", type=int, default=8)
     parser.add_argument("--payload-size", type=int, default=900)
-    parser.add_argument("--queue-depth", type=int, default=2)
+    parser.add_argument("--queue-depth", type=int, default=3)
     parser.add_argument("--capture-backend", choices=("avfoundation", "screencapturekit"), default="screencapturekit")
     parser.add_argument("--encoder", choices=("cpu", "videotoolbox"), default="cpu")
     parser.add_argument("--motion", action="store_true", help="Animate the synthetic raw source")

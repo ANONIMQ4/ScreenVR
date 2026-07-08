@@ -16,8 +16,10 @@ def parse_args():
     parser.add_argument("--size", default="900x600")
     parser.add_argument("--bitrate", default="5000k")
     parser.add_argument("--fit", choices=("contain", "cover"), default="contain")
+    parser.add_argument("--encoder", choices=("cpu", "videotoolbox"), default="cpu")
     parser.add_argument("--capture-backend", choices=("avfoundation", "screencapturekit"), default="avfoundation")
     parser.add_argument("--capture-cursor", choices=("0", "1"), default="0")
+    parser.add_argument("--queue-depth", type=int, default=3)
     parser.add_argument("--payload-size", type=int, default=1200)
     parser.add_argument("--control-host", default="0.0.0.0")
     parser.add_argument("--control-port", type=int, default=8095)
@@ -92,27 +94,53 @@ def build_cmd(args):
             video_filter,
             "-an",
         ]
+    if args.encoder == "videotoolbox":
+        cmd += [
+            "-c:v",
+            "h264_videotoolbox",
+            "-profile:v",
+            "baseline",
+            "-realtime",
+            "1",
+            "-prio_speed",
+            "1",
+            "-pix_fmt",
+            "nv12",
+            "-b:v",
+            args.bitrate,
+            "-maxrate",
+            args.bitrate,
+            "-bufsize",
+            args.bitrate,
+            "-g",
+            str(args.fps),
+            "-bf",
+            "0",
+        ]
+    else:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            args.bitrate,
+            "-maxrate",
+            args.bitrate,
+            "-bufsize",
+            args.bitrate,
+            "-g",
+            str(args.fps),
+            "-bf",
+            "0",
+            "-x264-params",
+            f"keyint={args.fps}:min-keyint={args.fps}:scenecut=0:repeat-headers=1",
+        ]
     cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        args.bitrate,
-        "-maxrate",
-        args.bitrate,
-        "-bufsize",
-        args.bitrate,
-        "-g",
-        str(args.fps),
-        "-bf",
-        "0",
-        "-x264-params",
-        f"keyint={args.fps}:min-keyint={args.fps}:scenecut=0:repeat-headers=1",
         "-payload_type",
         "96",
         "-f",
@@ -133,6 +161,8 @@ def sck_cmd(args):
         height,
         "--fps",
         str(args.fps),
+        "--queue-depth",
+        str(args.queue_depth),
     ]
 
 
@@ -190,10 +220,12 @@ class RtpStream:
             fps = clamp_int(payload.get("fps", self.args.fps), 10, 300)
             bitrate = clamp_int(payload.get("bitrate", str(self.args.bitrate).rstrip("k")), 300, 25000)
             fit = str(payload.get("fit", self.args.fit)).lower()
+            encoder = str(payload.get("encoder", self.args.encoder)).lower()
             self.args.size = f"{width}x{height}"
             self.args.fps = fps
             self.args.bitrate = f"{bitrate}k"
             self.args.fit = fit if fit in ("contain", "cover") else "contain"
+            self.args.encoder = encoder if encoder in ("cpu", "videotoolbox") else "cpu"
             self._stop_locked()
             self._start_locked()
             return {
@@ -202,13 +234,14 @@ class RtpStream:
                 "fps": fps,
                 "bitrate": bitrate,
                 "fit": self.args.fit,
+                "encoder": self.args.encoder,
             }
 
     def _start_locked(self):
         print(
             f"Sending RTP/H.264 to rtp://{self.args.dest}:{self.args.port} "
             f"size={self.args.size} fps={self.args.fps} bitrate={self.args.bitrate} "
-            f"capture={self.args.capture_backend}",
+            f"capture={self.args.capture_backend} encoder={self.args.encoder}",
             flush=True,
         )
         if self.args.capture_backend == "screencapturekit":

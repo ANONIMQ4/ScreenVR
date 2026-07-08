@@ -160,7 +160,7 @@ if #available(macOS 12.3, *) {
         width: intArg("--width", fallback: 960),
         height: intArg("--height", fallback: 540),
         fps: intArg("--fps", fallback: 30),
-        queueDepth: intArg("--queue-depth", fallback: 2)
+        queueDepth: intArg("--queue-depth", fallback: 3)
     )
 
     Task {
