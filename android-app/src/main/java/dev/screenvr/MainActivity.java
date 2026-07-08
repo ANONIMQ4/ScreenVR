@@ -1,9 +1,14 @@
 package dev.screenvr;
 
+import android.Manifest;
 import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.Surface;
 import android.view.Gravity;
@@ -25,6 +30,8 @@ import java.net.URL;
 import java.util.Locale;
 
 public class MainActivity extends Activity implements VrVideoView.VideoSurfaceListener {
+    private static final int REQUEST_BLUETOOTH_HID = 7001;
+    private static final int REQUEST_DISCOVERABLE = 7002;
     private static final String PREFS = "screen_vr_client";
     private static final String URL_KEY = "stream_url";
     private static final String SBS_KEY = "sbs_enabled";
@@ -71,10 +78,12 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     private Button fitButton;
     private Button lensButton;
     private Button maskButton;
+    private Button btHidButton;
     private Surface videoSurface;
     private String activeRawUrl;
     private Surface activeRawSurface;
     private final FrameLatencyTracker latencyTracker = new FrameLatencyTracker();
+    private BluetoothHidHeadTracker hidHeadTracker;
     private volatile float decoderReadFps;
     private volatile float decoderInputFps;
     private volatile float decoderOutputFps;
@@ -323,7 +332,88 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         });
         sizeRow.addView(lensApply);
 
+        btHidButton = new Button(this);
+        btHidButton.setText("BT HID");
+        btHidButton.setOnClickListener(v -> startOrCenterBluetoothHid());
+        btHidButton.setOnLongClickListener(v -> {
+            if (hidHeadTracker != null) {
+                hidHeadTracker.stop();
+            }
+            updateBtHidButton("BT HID");
+            hideSystemUi();
+            return true;
+        });
+        sizeRow.addView(btHidButton);
+
         return box;
+    }
+
+    private void startOrCenterBluetoothHid() {
+        BluetoothHidHeadTracker tracker = ensureHidHeadTracker();
+        if (!hasBluetoothHidPermissions()) {
+            if (Build.VERSION.SDK_INT >= 31) {
+                requestPermissions(new String[]{
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_ADVERTISE
+                }, REQUEST_BLUETOOTH_HID);
+            }
+            return;
+        }
+        requestDiscoverable();
+        if (tracker.isRunning()) {
+            tracker.center();
+            updateBtHidButton("BT center");
+        } else {
+            tracker.start();
+        }
+        hideSystemUi();
+    }
+
+    private BluetoothHidHeadTracker ensureHidHeadTracker() {
+        if (hidHeadTracker == null) {
+            hidHeadTracker = new BluetoothHidHeadTracker(this);
+            hidHeadTracker.setStatusListener(status -> runOnUiThread(() -> updateBtHidButton(status)));
+        }
+        return hidHeadTracker;
+    }
+
+    private boolean hasBluetoothHidPermissions() {
+        if (Build.VERSION.SDK_INT < 31) {
+            return true;
+        }
+        return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestDiscoverable() {
+        if (Build.VERSION.SDK_INT >= 31
+                && checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        Intent intent = new Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
+        intent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300);
+        startActivityForResult(intent, REQUEST_DISCOVERABLE);
+    }
+
+    private void updateBtHidButton(String status) {
+        if (btHidButton == null) {
+            return;
+        }
+        if (status == null || status.isEmpty()) {
+            btHidButton.setText("BT HID");
+        } else if (status.contains("connected")) {
+            btHidButton.setText("BT on");
+        } else if (status.contains("registered") || status.contains("waiting") || status.contains("pair")) {
+            btHidButton.setText("BT wait");
+        } else if (status.contains("stopped") || status.contains("failed") || status.contains("missing")
+                || status.contains("off")) {
+            btHidButton.setText("BT HID");
+        } else {
+            btHidButton.setText("BT HID");
+        }
+        if (hintView != null) {
+            hintView.setText(status);
+        }
     }
 
     private EditText smallInput(String value, String hint) {
@@ -647,6 +737,14 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
         activeRawSurface = null;
     }
 
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_BLUETOOTH_HID && hasBluetoothHidPermissions()) {
+            startOrCenterBluetoothHid();
+        }
+    }
+
     private void toggleControls() {
         boolean show = controls.getVisibility() != View.VISIBLE;
         controls.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -693,6 +791,9 @@ public class MainActivity extends Activity implements VrVideoView.VideoSurfaceLi
     protected void onDestroy() {
         super.onDestroy();
         stopRawH264();
+        if (hidHeadTracker != null) {
+            hidHeadTracker.stop();
+        }
         videoSurface = null;
     }
 }
