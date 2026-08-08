@@ -32,8 +32,6 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
     private static final String TAG = "ScreenVR-BT-HID";
     private static final int REPORT_ID = 1;
     private static final float FULL_SCALE_DEGREES = 90f;
-    private static final int AXIS_MODE_COUNT = 11;
-    private static volatile BluetoothHidHeadTracker activeTracker;
 
     private final Context context;
     private final SensorManager sensorManager;
@@ -56,25 +54,12 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
     private boolean hasRotation;
     private boolean centered;
     private boolean centerPending = true;
-    private int axisMode = 10;
-    private long debugOverrideUntilMs;
-    private short debugYawAxis;
-    private short debugPitchAxis;
-    private short debugZAxis;
-    private short debugRollAxis;
-    private short debugRyAxis;
-    private short debugRzAxis;
 
     BluetoothHidHeadTracker(Context context) {
         this.context = context.getApplicationContext();
         sensorManager = (SensorManager) this.context.getSystemService(Context.SENSOR_SERVICE);
         BluetoothManager bluetoothManager = (BluetoothManager) this.context.getSystemService(Context.BLUETOOTH_SERVICE);
         adapter = bluetoothManager != null ? bluetoothManager.getAdapter() : null;
-        activeTracker = this;
-    }
-
-    static BluetoothHidHeadTracker activeTracker() {
-        return activeTracker;
     }
 
     boolean hasRuntimePermission() {
@@ -156,7 +141,6 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
     void center() {
         boolean centeredNow = false;
         synchronized (latestRotationMatrix) {
-            debugOverrideUntilMs = 0L;
             if (hasRotation) {
                 captureCenterLocked();
                 centeredNow = true;
@@ -167,35 +151,6 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
         }
         sendCurrentReport();
         report(centeredNow ? "BT HID center set" : "BT HID center pending");
-    }
-
-    void setDebugAxes(short yawAxis, short pitchAxis, short rollAxis, long durationMs) {
-        setDebugAxes(yawAxis, pitchAxis, (short) 0, rollAxis, (short) 0, (short) 0, durationMs);
-    }
-
-    void setDebugAxes(short xAxis, short yAxis, short zAxis, short rxAxis, short ryAxis, short rzAxis, long durationMs) {
-        synchronized (latestRotationMatrix) {
-            debugYawAxis = xAxis;
-            debugPitchAxis = yAxis;
-            debugZAxis = zAxis;
-            debugRollAxis = rxAxis;
-            debugRyAxis = ryAxis;
-            debugRzAxis = rzAxis;
-            debugOverrideUntilMs = System.currentTimeMillis() + Math.max(0L, durationMs);
-        }
-        sendCurrentReport();
-        report("BT HID debug axes x=" + xAxis + " y=" + yAxis + " z=" + zAxis
-                + " rx=" + rxAxis + " ry=" + ryAxis + " rz=" + rzAxis);
-    }
-
-    void setAxisMode(int mode) {
-        axisMode = Math.floorMod(mode, AXIS_MODE_COUNT);
-        center();
-        report("BT HID axis mode " + axisMode);
-    }
-
-    int axisMode() {
-        return axisMode;
     }
 
     private void registerApp() {
@@ -355,10 +310,6 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
         float pitch;
         float roll;
         synchronized (latestRotationMatrix) {
-            if (System.currentTimeMillis() < debugOverrideUntilMs) {
-                return reportFromAxes(debugYawAxis, debugPitchAxis, debugZAxis,
-                        debugRollAxis, debugRyAxis, debugRzAxis);
-            }
             if (!hasRotation || !centered) {
                 return reportFromAxes((short) 0, (short) 0, (short) 0);
             }
@@ -396,31 +347,7 @@ final class BluetoothHidHeadTracker implements SensorEventListener {
     }
 
     private byte[] reportFromAngles(float yaw, float pitch, float roll) {
-        switch (axisMode) {
-            case 1:
-                return reportFromAxes(axisFromRadians(roll), axisFromRadians(-pitch), axisFromRadians(yaw));
-            case 2:
-                return reportFromAxes(axisFromRadians(-roll), axisFromRadians(-pitch), axisFromRadians(yaw));
-            case 3:
-                return reportFromAxes(axisFromRadians(pitch), axisFromRadians(-yaw), axisFromRadians(roll));
-            case 4:
-                return reportFromAxes(axisFromRadians(-pitch), axisFromRadians(yaw), axisFromRadians(roll));
-            case 5:
-                return reportFromAxes(axisFromRadians(-yaw), axisFromRadians(-pitch), axisFromRadians(roll));
-            case 6:
-                return reportFromAxes(axisFromRadians(-pitch), axisFromRadians(-yaw), axisFromRadians(roll));
-            case 7:
-                return reportFromAxes(axisFromRadians(-pitch), axisFromRadians(roll), axisFromRadians(yaw));
-            case 8:
-                return reportFromAxes(axisFromRadians(-pitch), axisFromRadians(-roll), axisFromRadians(yaw));
-            case 9:
-                return reportFromAxes(axisFromRadians(-pitch), axisFromRadians(pitch), axisFromRadians(roll));
-            case 10:
-                return reportFromAxes(axisFromRadians(-pitch), (short) 0, axisFromRadians(-roll));
-            case 0:
-            default:
-                return reportFromAxes(axisFromRadians(yaw), axisFromRadians(-pitch), axisFromRadians(roll));
-        }
+        return reportFromAxes(axisFromRadians(-pitch), (short) 0, axisFromRadians(-roll));
     }
 
     private static short axisFromRadians(float radians) {

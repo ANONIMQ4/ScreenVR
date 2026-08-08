@@ -4,54 +4,38 @@
 
 Check these in order:
 
-1. USB reverse ports:
+1. Mac server and encoder:
 
    ```bash
-   adb reverse --list
+   ps -axo pid,%cpu,%mem,etime,command | rg 'rtp-screen-server|sck-capture|ffmpeg|PID'
    ```
 
-   Expected:
+   Normally there should be one Python server, one `sck-capture`, and one `ffmpeg`.
 
-   ```text
-   tcp:8094 tcp:8094
-   tcp:8095 tcp:8095
-   ```
+2. macOS Screen Recording permission.
 
-2. Mac server and encoder:
-
-   ```bash
-   ps -axo pid,%cpu,%mem,etime,command | rg 'mac-screen-server|ffmpeg|PID'
-   ```
-
-   Normally there should be one Python server and one `ffmpeg`.
-
-3. macOS Screen Recording permission.
-
-   If the launcher was rebuilt, macOS may treat it as a new app. Remove and re-add `ScreenVR Launcher.app` in:
+   Make sure the terminal or app that starts the stream is allowed in:
 
    ```text
    System Settings -> Privacy & Security -> Screen & System Audio Recording
    ```
 
-4. Android client URL:
+3. Android client URL:
 
    ```text
-   rawh264://127.0.0.1:8094?w=1170&h=1080
+   rtph264://0.0.0.0:5004?w=1200&h=800&fps=60
    ```
 
 ## Kill Stuck Stream Processes
 
 ```bash
-pkill -f mac-screen-server.py || true
-ps -axo pid=,command= | awk '/ffmpeg/ && /-f h264/ && /pipe:1/ {print $1}' | xargs -r kill -9
+pkill -f 'rtp-screen-server.py|sck-capture|ffmpeg' || true
 ```
 
 ## Current Good Presets
 
 ```text
-Native:   1170x1080 30fps 5000kbps contain
-Balanced: 960x540   30fps 2500kbps contain
-Fast:     800x450   30fps 1600kbps contain
+Known good: 1200x800 60fps 3000kbps contain
 ```
 
 ## App Id

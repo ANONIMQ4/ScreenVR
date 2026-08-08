@@ -16,7 +16,7 @@ git -C "$ROOT" show "$SERVER_COMMIT:server/rtp-screen-server.py" > "$TMP_DIR/rtp
 git -C "$ROOT" show "$SERVER_COMMIT:server/sck-capture.swift" > "$TMP_DIR/sck-capture.swift"
 chmod +x "$TMP_DIR/rtp-screen-server.py"
 
-pkill -f 'rtp-screen-server.py|mac-screen-server.py|sck-capture|ffmpeg' 2>/dev/null || true
+pkill -f 'rtp-screen-server.py|sck-capture|ffmpeg' 2>/dev/null || true
 
 cat > "$LOG_DIR/screen_vr_client_rtp.xml" <<XML
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>

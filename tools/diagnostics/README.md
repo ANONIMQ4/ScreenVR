@@ -28,14 +28,10 @@ What each test checks:
 Useful stress probes:
 
 ```sh
-python3 tools/diagnostics/pipeline_diagnostics.py source --size 1800x1200 --fps 120 --duration 5
-python3 tools/diagnostics/pipeline_diagnostics.py synthetic --size 1800x1200 --fps 120 --bitrate 10000k --duration 5
 python3 tools/diagnostics/pipeline_diagnostics.py encoder --size 450x300 --fps 300
 python3 tools/diagnostics/pipeline_diagnostics.py avfoundation --size 450x300 --fps 300
 python3 tools/diagnostics/pipeline_diagnostics.py sck --size 900x600 --fps 60
 ```
-
-`source` uses `raw-frame-source.swift`, a paced raw BGRA generator. `synthetic` pipes that exact-FPS source into ffmpeg/x264. If `synthetic` passes but `sck` or `avfoundation` fails, capture/display pacing is the bottleneck.
 
 `sck` and `sck-encode` also report capture pacing:
 

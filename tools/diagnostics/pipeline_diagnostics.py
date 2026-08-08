@@ -22,8 +22,6 @@ def parse_args():
             "all",
             "processes",
             "encoder",
-            "source",
-            "synthetic",
             "avfoundation",
             "sck",
             "sck-encode",
@@ -42,7 +40,6 @@ def parse_args():
     parser.add_argument("--queue-depth", type=int, default=3)
     parser.add_argument("--capture-backend", choices=("avfoundation", "screencapturekit"), default="screencapturekit")
     parser.add_argument("--encoder", choices=("cpu", "videotoolbox"), default="cpu")
-    parser.add_argument("--motion", action="store_true", help="Animate the synthetic raw source")
     parser.add_argument("--min-width", type=int, default=600)
     parser.add_argument("--max-width", type=int, default=1800)
     parser.add_argument("--aspect", default="3:2")
@@ -147,18 +144,6 @@ def parse_sck_stats(text):
     }
 
 
-def parse_source_stats(text):
-    values = [float(match) for match in re.findall(r"source fps ([0-9.]+)", text)]
-    done = [float(match) for match in re.findall(r"source done fps ([0-9.]+)", text)]
-    late = [int(match) for match in re.findall(r"late (\d+)", text)]
-    return {
-        "last_source_fps": values[-1] if values else None,
-        "avg_source_fps": round(sum(values) / len(values), 2) if values else None,
-        "done_source_fps": done[-1] if done else None,
-        "late_frames": late[-1] if late else None,
-    }
-
-
 def parse_android_decode(text):
     matches = re.findall(
         r"Work-Rate: Q\(([0-9.]+)/s Avg=([0-9.]+)/s\) Done\(([0-9.]+)/s Avg=([0-9.]+)/s\).*?Stream: ([0-9.]+)fps ([0-9.]+)([KMG])?bps",
@@ -259,123 +244,6 @@ def encoder_test(args):
     result = run(cmd, timeout=args.duration + 10)
     stats = parse_ffmpeg_stats(result.stderr)
     stats["ok"] = (stats.get("avg_speed") or 0) >= 0.98
-    return stats
-
-
-def raw_source_binary():
-    source = os.path.join(ROOT, "tools", "diagnostics", "raw-frame-source.swift")
-    binary = os.path.join(ROOT, "tools", "diagnostics", "raw-frame-source")
-    if os.path.exists(binary) and os.path.getmtime(binary) >= os.path.getmtime(source):
-        return binary
-    run(["swiftc", source, "-o", binary], timeout=30)
-    return binary
-
-
-def source_test(args):
-    width, height = args.size.split("x", 1)
-    cmd = [
-        raw_source_binary(),
-        "--width",
-        width,
-        "--height",
-        height,
-        "--fps",
-        str(args.fps),
-        "--duration",
-        str(args.duration),
-    ]
-    if args.motion:
-        cmd.extend(["--motion", "1"])
-    with open(os.devnull, "wb") as devnull:
-        process = subprocess.Popen(
-            cmd,
-            cwd=ROOT,
-            text=True,
-            stdout=devnull,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        try:
-            _, stderr = process.communicate(timeout=args.duration + 15)
-        except subprocess.TimeoutExpired:
-            stop_process(process)
-            stderr = process.stderr.read() if process.stderr else ""
-            stats = parse_source_stats(stderr)
-            stats["ok"] = False
-            stats["error"] = "raw source did not finish before timeout"
-            return stats
-    stats = parse_source_stats(stderr)
-    max_late = max(2, int(args.fps * args.duration * 0.03))
-    stats["ok"] = (stats.get("done_source_fps") or 0) >= args.fps * 0.98 and (stats.get("late_frames") or 0) <= max_late
-    return stats
-
-
-def synthetic_test(args):
-    width, height = args.size.split("x", 1)
-    source_cmd = [
-        raw_source_binary(),
-        "--width",
-        width,
-        "--height",
-        height,
-        "--fps",
-        str(args.fps),
-        "--duration",
-        str(args.duration),
-    ]
-    if args.motion:
-        source_cmd.extend(["--motion", "1"])
-    source = subprocess.Popen(
-        source_cmd,
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-    )
-    ffmpeg = subprocess.Popen(
-        [
-            ffmpeg_path(),
-            "-hide_banner",
-            "-stats",
-            "-stats_period",
-            "1",
-            "-loglevel",
-            "warning",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgra",
-            "-s",
-            args.size,
-            "-framerate",
-            str(args.fps),
-            "-i",
-            "pipe:0",
-            "-an",
-            *encoder_args(args),
-            "-f",
-            "null",
-            "-",
-        ],
-        cwd=ROOT,
-        stdin=source.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-    )
-    source.stdout.close()
-    try:
-        _, ffmpeg_stderr = ffmpeg.communicate(timeout=args.duration + 20)
-        _, source_stderr = source.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        stop_process(ffmpeg)
-        stop_process(source)
-        return {"ok": False, "error": "synthetic pipeline did not finish before timeout"}
-    text = source_stderr.decode("utf-8", errors="replace") + "\n" + ffmpeg_stderr.decode("utf-8", errors="replace")
-    stats = parse_source_stats(text)
-    stats.update(parse_ffmpeg_stats(text))
-    max_late = max(2, int(args.fps * args.duration * 0.03))
-    stats["ok"] = (stats.get("avg_speed") or 0) >= 0.98 and (stats.get("late_frames") or 0) <= max_late
     return stats
 
 
@@ -720,8 +588,6 @@ def main():
     tests = {
         "processes": lambda: process_conflicts(args.port),
         "encoder": lambda: encoder_test(args),
-        "source": lambda: source_test(args),
-        "synthetic": lambda: synthetic_test(args),
         "avfoundation": lambda: avfoundation_test(args),
         "sck": lambda: sck_test(args),
         "sck-encode": lambda: sck_encode_test(args),
@@ -729,7 +595,7 @@ def main():
         "android-decode": lambda: android_decode_test(args),
         "bisect-size": lambda: bisect_size_test(args),
     }
-    order = ["processes", "encoder", "source", "synthetic", "avfoundation", "sck", "sck-encode", "rtp", "android-decode"]
+    order = ["processes", "encoder", "avfoundation", "sck", "sck-encode", "rtp", "android-decode"]
     if args.test == "all":
         summary = {}
         for name in order:
