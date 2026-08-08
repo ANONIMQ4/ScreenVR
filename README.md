@@ -3,7 +3,7 @@
 Low-latency Mac screen streaming to an Android phone for flat or SBS/Cardboard viewing.
 
 ```text
-Mac screen -> ffmpeg raw H.264 -> TCP 8094 -> adb reverse -> Android MediaCodec -> OpenGL SBS view
+Mac ScreenCaptureKit -> ffmpeg H.264 RTP -> LAN UDP 5004 -> Android MediaCodec -> OpenGL SBS view
 ```
 
 ## Structure
@@ -57,7 +57,29 @@ macos/build/ScreenVR Launcher.app
 
 Open the app, allow Screen Recording in macOS Privacy settings, then restart it. The launcher starts the stream automatically and exposes presets plus width, height, FPS, bitrate, and fit controls.
 
-## Manual Stream
+## Known-Good RTP Stream
+
+The current best performing stream uses RTP/H.264 over LAN:
+
+```bash
+python3 server/rtp-screen-server.py \
+  --dest <PHONE_LAN_IP> \
+  --size 1200x800 \
+  --fps 60 \
+  --bitrate 3000k \
+  --queue-depth 3 \
+  --capture-backend screencapturekit \
+  --payload-size 1200 \
+  --control-host 0.0.0.0
+```
+
+Android URL:
+
+```text
+rtph264://0.0.0.0:5004?w=1200&h=800&fps=60
+```
+
+## Legacy Raw TCP Stream
 
 Useful when debugging without the launcher:
 
