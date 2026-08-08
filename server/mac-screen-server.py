@@ -58,6 +58,63 @@ class H264StreamStats:
         self.last_report = now
 
 
+class H264AccessUnitSplitter:
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def add(self, chunk):
+        self.buffer.extend(chunk)
+        units = []
+        while True:
+            first = self.find_aud(0)
+            if first < 0:
+                if len(self.buffer) > 1024 * 1024:
+                    del self.buffer[:-5]
+                break
+            if first > 0:
+                del self.buffer[:first]
+            second = self.find_aud(5)
+            if second < 0:
+                break
+            units.append(bytes(self.buffer[:second]))
+            del self.buffer[:second]
+        return units
+
+    def find_aud(self, start):
+        three = self.buffer.find(b"\x00\x00\x01\x09", start)
+        four = self.buffer.find(b"\x00\x00\x00\x01\x09", start)
+        if three < 0:
+            return four
+        if four < 0:
+            return three
+        return min(three, four)
+
+
+class LatestFrameRelay:
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.latest = None
+        self.closed = False
+
+    def put(self, frame):
+        with self.condition:
+            self.latest = frame
+            self.condition.notify()
+
+    def get(self):
+        with self.condition:
+            while self.latest is None and not self.closed:
+                self.condition.wait()
+            frame = self.latest
+            self.latest = None
+            return frame
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
@@ -70,6 +127,7 @@ def parse_args():
     parser.add_argument("--encoder", choices=("cpu", "videotoolbox"), default="cpu")
     parser.add_argument("--capture-backend", choices=("avfoundation", "screencapturekit"), default="avfoundation")
     parser.add_argument("--capture-cursor", choices=("0", "1"), default="0")
+    parser.add_argument("--transport", choices=("raw", "frames"), default="raw")
     return parser.parse_args()
 
 
@@ -85,6 +143,7 @@ class StreamConfig:
         self.encoder = str(args.encoder)
         self.capture_backend = str(args.capture_backend)
         self.capture_cursor = str(args.capture_cursor)
+        self.transport = str(args.transport)
 
     def snapshot(self):
         with self.lock:
@@ -97,6 +156,7 @@ class StreamConfig:
                 "encoder": self.encoder,
                 "capture_backend": self.capture_backend,
                 "capture_cursor": self.capture_cursor,
+                "transport": self.transport,
             }
 
     def update(self, payload):
@@ -361,12 +421,15 @@ def pipe_to_client(conn, config_store):
         active_procs = procs
     stats = H264StreamStats()
     try:
-        while True:
-            chunk = proc.stdout.read(32768)
-            if not chunk:
-                break
-            stats.add(chunk)
-            conn.sendall(chunk)
+        if config.get("transport") == "frames":
+            pipe_frames_to_client(proc, conn, stats)
+        else:
+            while True:
+                chunk = proc.stdout.read(32768)
+                if not chunk:
+                    break
+                stats.add(chunk)
+                conn.sendall(chunk)
     except OSError:
         pass
     finally:
@@ -379,6 +442,32 @@ def pipe_to_client(conn, config_store):
             if active_procs == procs:
                 active_procs = []
         print("client disconnected", flush=True)
+
+
+def pipe_frames_to_client(proc, conn, stats):
+    relay = LatestFrameRelay()
+    splitter = H264AccessUnitSplitter()
+
+    def read_frames():
+        try:
+            while True:
+                chunk = proc.stdout.read(32768)
+                if not chunk:
+                    break
+                stats.add(chunk)
+                for frame in splitter.add(chunk):
+                    relay.put(frame)
+        finally:
+            relay.close()
+
+    reader = threading.Thread(target=read_frames, daemon=True)
+    reader.start()
+    while True:
+        frame = relay.get()
+        if frame is None:
+            break
+        conn.sendall(len(frame).to_bytes(4, "big"))
+        conn.sendall(frame)
 
 
 def stop_process(proc):

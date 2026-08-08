@@ -17,10 +17,11 @@ Flow:
 python3 tools/ets2-bthid/apply_controls.py
 ```
 
-The script maps the phone HID device to `joy2` and routes:
+The script maps the latest phone HID device to `joy2` in every ETS2 Steam
+profile and routes:
 
 - `joy2.x` -> TrackIR yaw
-- `joy2.y` -> TrackIR pitch
-- `joy2.rx` -> TrackIR roll
+- `joy2.rx` -> TrackIR pitch
+- `0` -> TrackIR roll
 
-It writes a timestamped backup next to `controls_osx.sii` before editing.
+It writes a timestamped backup next to each edited `controls_osx.sii`.

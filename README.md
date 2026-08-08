@@ -73,6 +73,33 @@ Android URL:
 rawh264://127.0.0.1:8094?w=1170&h=1080
 ```
 
+## Known-Good RTP + ETS2 Head Tracking
+
+The current best performing LAN stream uses RTP/H.264 from commit `b10e97d`
+and Android Bluetooth HID head tracking from commit `607c64d`.
+
+```bash
+scripts/start-working-rtp.sh
+python3 tools/ets2-bthid/apply_controls.py
+```
+
+The RTP profile is `1200x800`, `60 fps`, `3000k`, `queue-depth 3`,
+`screencapturekit`, with Android URL:
+
+```text
+rtph264://0.0.0.0:5004?w=1200&h=800&fps=60
+```
+
+The ETS2 helper maps the latest S23 Bluetooth HID device in every Steam profile:
+
+```text
+trackiryaw   = joy2.x
+trackirpitch = joy2.rx
+trackirroll  = 0
+```
+
+More details: `docs/working-rtp-launch.md`.
+
 ## Clean Workspace
 
 ```bash

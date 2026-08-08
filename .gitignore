@@ -13,6 +13,7 @@ __pycache__/
 *.pyc
 server/sck-capture
 tools/diagnostics/raw-frame-source
+tools/hid-bridge/screenvr-hid-bridge
 tmp_screen_vr_client.xml
 .DS_Store
 .idea/

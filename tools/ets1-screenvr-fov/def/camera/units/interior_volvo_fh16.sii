@@ -1,0 +1,14 @@
+actor_interior_camera: camera.interior.volvo.fh16
+{
+	camera_offset: (-0.51, 2.45, 0.0)
+	camera_fov: 90
+	mouse_right_limit: -95
+	mouse_left_limit: 95
+	mouse_up_limit: 35
+	mouse_down_limit: -35
+
+	mouse_up_down_default: -10
+	mouse_sensitivity: 0.16
+
+	uplift: 0.0
+}
