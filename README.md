@@ -24,4 +24,3 @@ trackirroll  = 0
 
 Подробности по рабочему запуску: `docs/working-rtp-launch.md`.
 
-Скрипт удаляет Gradle output, временные файлы, `.DS_Store` и пустые папки.
